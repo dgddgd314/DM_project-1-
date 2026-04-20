@@ -1,0 +1,17 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# CHZZK Crawler - 3 Daily Windows (KST times shown in comments)
+# Each session: build pool 100 -> random 15 -> refresh DB -> crawl 2 hours
+
+# Window 1: 5:00 PM - 7:00 PM KST (08:00 UTC)
+0 8 * * * cd /home/ubuntu/app/chzzk-crawler && source .venv/bin/activate && python build_pool.py && python scripts/setup.py --load-csv top15_targets.csv && python scripts/run_pilot.py --window evening1 --duration 7200 >> /home/ubuntu/app/chzzk-crawler/logs/cron.log 2>&1
+
+# Window 2: 8:00 PM - 10:00 PM KST (11:00 UTC)
+0 11 * * * cd /home/ubuntu/app/chzzk-crawler && source .venv/bin/activate && python build_pool.py && python scripts/setup.py --load-csv top15_targets.csv && python scripts/run_pilot.py --window evening2 --duration 7200 >> /home/ubuntu/app/chzzk-crawler/logs/cron.log 2>&1
+
+# Window 3: 11:00 PM - 1:00 AM KST (14:00 UTC)
+0 14 * * * cd /home/ubuntu/app/chzzk-crawler && source .venv/bin/activate && python build_pool.py && python scripts/setup.py --load-csv top15_targets.csv && python scripts/run_pilot.py --window night --duration 7200 >> /home/ubuntu/app/chzzk-crawler/logs/cron.log 2>&1
+
+# Window 4 (Test/Audit): 2:00 AM - 2:30 AM KST (17:00 UTC)
+0 17 * * * cd /home/ubuntu/app/chzzk-crawler && source .venv/bin/activate && python build_pool.py && python scripts/setup.py --load-csv top15_targets.csv && python scripts/run_pilot.py --window audit_check --duration 1800 >> /home/ubuntu/app/chzzk-crawler/logs/cron.log 2>&1

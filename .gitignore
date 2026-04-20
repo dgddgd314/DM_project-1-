@@ -1,0 +1,25 @@
+# Ignore massive data files
+*.csv
+*.xlsx
+*.tar.gz
+*.zip
+*.7z
+
+# Ignore folders likely containing data
+exports/
+exports_individual/
+patched/
+temp/
+
+# Ignore environment variables
+.env
+.env.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
