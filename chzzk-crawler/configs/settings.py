@@ -29,6 +29,7 @@ class Settings:
     snapshot_interval_seconds: int = int(os.getenv("SNAPSHOT_INTERVAL_SECONDS", "60"))
     chat_flush_interval_seconds: int = int(os.getenv("CHAT_FLUSH_INTERVAL_SECONDS", "3"))
     chat_flush_batch_size: int = int(os.getenv("CHAT_FLUSH_BATCH_SIZE", "200"))
+    export_interval_seconds: int = int(os.getenv("EXPORT_INTERVAL_SECONDS", "600"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     @property
