@@ -1,0 +1,33 @@
+Plot 자동 생성 기록
+====================
+이 파일은 make_plots() 실행 시 out/plots/*.png와 함께 자동 생성된다.
+그래프 구성은 기존 EDA notebook의 발표용 핵심 plot 흐름을 유지하되, overlay/중복 plot은 줄였다.
+
+공통 스타일
+----------
+저장: dpi=200, bbox_inches='tight'
+폰트: Malgun Gothic 우선, DejaVu Sans fallback, unicode minus 보정
+grid: alpha 0.2~0.3
+session map 좌표: x=median_viewer(log scale), y=median_gap
+session map 색: zero_chat_rate 또는 cluster label
+session map 점 크기: 기존 notebook 방식 유지 - max_gap*30 또는 45+25*log1p(max_zero_run)
+detector/model overlay: 일반 session은 alpha=0.25, flag/top session은 red edge와 alpha=0.9
+
+생성 plot
+---------
+- plots\01_data_quality.png
+- plots\02_dist_time.png
+- plots\03_view_chat.png
+- plots\04_cluster.png
+- plots\05_detectors.png
+- plots\06_models.png
+
+주요 파일 해석
+------------
+01_data_quality.png: 세션 필터링, zero-chat 품질 진단
+02_dist_time.png: gap/chat 분포와 시간 경과별 median/IQR trajectory
+03_view_chat.png: viewer-chat 관계, 1분 변화량, lag response
+04_cluster.png: KMeans 선택/지도, profile, GMM/HDBSCAN robustness map
+05_detectors.png: IF/LOF/OCSVM 비지도 detector별 review map
+06_models.png: AE/Synthetic supervised model score별 review map
+07_pu.png: manual positive label이 있을 때만 생성되는 PU score map

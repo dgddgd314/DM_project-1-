@@ -1,0 +1,37 @@
+path:
+  in_dir: data/features
+  pattern: "Run_*_Features.xlsx"
+  out_dir: out
+  label_file: data/labels/manual_labels.csv
+
+time:
+  shift_hours: 9
+  drop_runs: []
+  drop_off_window: true
+  valid_windows: ["15:00-17:00", "17:00-19:00", "20:00-22:00", "23:00-01:00"]
+  tolerance_min: 1
+
+prep:
+  min_n: 10
+  zero_viewer_na: true
+
+cluster:
+  k_min: 2
+  k_max: 6
+  seed: 42
+  n_init: 50
+
+hdbscan:
+  min_sizes: [5, 8, 10]
+
+detector:
+  contam: 0.05
+  seed: 42
+
+synthetic:
+  seed: 42
+  n_per_type: 50
+
+model:
+  seed: 42
+  test_size: 0.25

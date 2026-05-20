@@ -1,0 +1,24 @@
+plot guide
+==========
+
+원칙
+- 중간발표 EDA_process에서 쓰던 발표용 스타일을 유지한다.
+- 불필요한 overlay/map 중복 파일은 만들지 않는다.
+- 실제 발표에서 바로 쓸 수 있는 요약 plot만 out/plots/에 저장한다.
+- 공통 review map 좌표: x=median_viewer(log scale), y=median_gap.
+- 공통 review map 스타일: color=zero_chat_rate, cmap=viridis, size=max_gap, 후보=red edge.
+- clustering map 스타일: x=median_viewer(log scale), y=median_gap, size=max_zero_run, color=cluster label.
+
+저장되는 plot
+- 01_data_quality.png: session filtering, non-zero chat ratio, zero-run, viewer decile zero-chat.
+- 02_dist_time.png: gap/chat 분포와 viewer/gap session trajectory.
+- 03_view_chat.png: viewer-chat level coupling, 1-minute delta, lag response.
+- 04_cluster.png: KMeans selection/map/profile + GMM/HDBSCAN 구조 확인.
+- 05_detectors.png: IsolationForest, LOF, OneClassSVM 후보를 한 화면에 비교.
+- 06_models.png: AutoEncoder, Synthetic SVM, XGBoost, LightGBM 후보를 한 화면에 비교.
+- 07_pu.png: manual positive label이 있을 때만 PU score map 저장.
+
+주의
+- 빨간 테두리는 확정 뷰봇 라벨이 아니라 해당 알고리즘의 후보 신호이다.
+- PU score가 없으면 blank plot을 만들지 않는다. score.txt와 scores_model.csv에서 상태만 확인한다.
+- 실제 clustering은 6개 feature에서 수행되고, 산점도는 해석용 2D projection이다.
