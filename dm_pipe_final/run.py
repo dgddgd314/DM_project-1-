@@ -838,15 +838,26 @@ def write_method_registry(out, cfg):
 
 def write_korean_m2_docs(out, cfg):
     out = Path(out)
+    review_cfg = cfg.get("m2_review", {})
+    eval_cfg = cfg.get("eval_robustness", {})
+    families = eval_cfg.get("families") or [
+        "scan_family_rank",
+        "persistence_family_rank",
+        "expected_response_family_rank",
+        "minute_state_family_rank",
+        "interval_anomaly_family_rank",
+        "reason_support_family_rank",
+    ]
+    aggregation = review_cfg.get("aggregation", "equal_weight_family_consensus_plus_family_rra")
     lines = [
         "# Method 2 최종 파이프라인",
         "",
         "목표: 확정 탐지가 아니라 viewer-chat mismatch 기반 수동 검토 우선순위를 만든다.",
         "`cluster_number`, `minute_cluster`, `rra_q`, `empirical_p`, `review_order`는 정답 라벨이나 확률이 아니다.",
         "",
-        "final review_order는 raw evidence RRA가 아니라 family-level equal-weight consensus + family RRA로 정렬한다.",
+        f"final review_order는 raw evidence RRA가 아니라 `{aggregation}` 설정에 따라 정렬한다.",
         "legacy threshold grid 산출물은 appendix diagnostic이며 final ranking을 직접 바꾸지 않는다.",
-        "Family evidence list: scan_family_rank, persistence_family_rank, expected_response_family_rank, minute_state_family_rank, interval_anomaly_family_rank, reason_support_family_rank.",
+        f"Family evidence list: {', '.join(map(str, families))}.",
         "scan_interval_rank, empirical_p_rank, scan_strength_rank는 같은 scan family의 내부 근거이며 final RRA에 각각 독립 evidence로 들어가지 않는다.",
         "persistence_family는 top interval duration과 state dwell evidence를 hard threshold 없이 rank/percentile 기반으로 반영한다.",
         "reason_support_rank는 continuous support 기반이며 설명 문구는 세션별 상위 근거를 순위 기반으로 선택한다.",
@@ -1863,6 +1874,17 @@ def _source_for_out_arcname(out, arcname):
     return Path(out).joinpath(*arc_path.parts[1:])
 
 
+def _replace_with_hardlink_or_copy(src, dst):
+    src = Path(src)
+    dst = Path(dst)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
 def create_zip(out, project_dir):
     out = Path(out)
     project_dir = Path(project_dir)
@@ -1884,9 +1906,9 @@ def create_zip(out, project_dir):
         for arcname in sorted(M2_REQUIRED_ARCHIVE_NAMES | M2_OPTIONAL_ARCHIVE_NAMES):
             _write_archive_file(zf, _source_for_out_arcname(out, arcname), arcname, written)
     alias = project_dir / FULL_ANALYSIS_ZIP_ALIAS
-    shutil.copy2(zip_path, alias)
+    _replace_with_hardlink_or_copy(zip_path, alias)
     print(f"압축파일을 저장했습니다: {zip_path}")
-    print(f"동일 내용의 호환 파일을 저장했습니다: {alias}")
+    print(f"동일 내용의 호환 파일을 연결했습니다: {alias}")
     return zip_path
 
 

@@ -3,7 +3,7 @@
 목표: 확정 탐지가 아니라 viewer-chat mismatch 기반 수동 검토 우선순위를 만든다.
 `cluster_number`, `minute_cluster`, `rra_q`, `empirical_p`, `review_order`는 정답 라벨이나 확률이 아니다.
 
-final review_order는 raw evidence RRA가 아니라 family-level equal-weight consensus + family RRA로 정렬한다.
+final review_order는 raw evidence RRA가 아니라 `equal_weight_family_consensus_plus_family_rra` 설정에 따라 정렬한다.
 legacy threshold grid 산출물은 appendix diagnostic이며 final ranking을 직접 바꾸지 않는다.
 Family evidence list: scan_family_rank, persistence_family_rank, expected_response_family_rank, minute_state_family_rank, interval_anomaly_family_rank, reason_support_family_rank.
 scan_interval_rank, empirical_p_rank, scan_strength_rank는 같은 scan family의 내부 근거이며 final RRA에 각각 독립 evidence로 들어가지 않는다.

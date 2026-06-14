@@ -267,6 +267,7 @@ eval_robustness:
     external_minutes_csv: data/synthetic/synthetic_many_minutes.csv
     external_intervals_csv: data/synthetic/synthetic_many_intervals.csv
     iou_thresholds: [0.3, 0.5, 0.7]
+    keep_intermediate: false
 
 docs:
   write_task_definition: true
@@ -290,4 +291,3 @@ handoff:
     - minute_model_feat.csv
   session_file: session_summary_processed.csv
   x_core_file: X_core_cols.txt
-

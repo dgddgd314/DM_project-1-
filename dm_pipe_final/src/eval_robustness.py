@@ -161,6 +161,14 @@ def _write_text(path, text):
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
+def _remove_if_exists(path):
+    path = Path(path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
 def _resolve_child_path(out, configured, default_rel):
     out = Path(out)
     raw = configured or default_rel
@@ -932,6 +940,7 @@ def run_synthetic_interval_recovery(out, eval_dir, cfg):
     syn_cfg = eval_cfg.get("synthetic", {})
     syn_dir = Path(eval_dir) / "synthetic"
     syn_dir.mkdir(parents=True, exist_ok=True)
+    keep_intermediate = bool(syn_cfg.get("keep_intermediate", False))
     minutes_path = _resolve_project_path(out, syn_cfg.get("external_minutes_csv", "data/synthetic/synthetic_injection_example_minutes.csv"))
     intervals_path = _resolve_project_path(out, syn_cfg.get("external_intervals_csv", "data/synthetic/synthetic_injection_example_intervals.csv"))
     thresholds = [float(x) for x in syn_cfg.get("iou_thresholds", [0.3, 0.5, 0.7])]
@@ -951,8 +960,12 @@ def run_synthetic_interval_recovery(out, eval_dir, cfg):
             "note": "Synthetic mismatch recovery sanity check was not run because required inputs were missing.",
         }])
         _write_csv(audit, syn_dir / "synthetic_key_audit.csv")
-        _write_csv(pd.DataFrame(), syn_dir / "synthetic_m2_scores.csv")
-        _write_csv(pd.DataFrame(), syn_dir / "synthetic_m2_scan.csv")
+        if keep_intermediate:
+            _write_csv(pd.DataFrame(), syn_dir / "synthetic_m2_scores.csv")
+            _write_csv(pd.DataFrame(), syn_dir / "synthetic_m2_scan.csv")
+        else:
+            _remove_if_exists(syn_dir / "synthetic_m2_scores.csv")
+            _remove_if_exists(syn_dir / "synthetic_m2_scan.csv")
         _write_csv(pd.DataFrame(columns=SYNTHETIC_RECOVERY_COLS), syn_dir / "synthetic_interval_recovery.csv", SYNTHETIC_RECOVERY_COLS)
         _write_csv(pd.DataFrame(), syn_dir / "synthetic_recovery_by_scenario.csv")
         return pd.DataFrame(columns=SYNTHETIC_RECOVERY_COLS)
@@ -982,16 +995,23 @@ def run_synthetic_interval_recovery(out, eval_dir, cfg):
         "note": "Synthetic rows are scored against real m2_scores distributions; they are not used for model fitting.",
     }])
     _write_csv(audit, syn_dir / "synthetic_key_audit.csv")
-    _write_csv(syn_scores, syn_dir / "synthetic_m2_scores.csv")
+    if keep_intermediate:
+        _write_csv(syn_scores, syn_dir / "synthetic_m2_scores.csv")
+    else:
+        _remove_if_exists(syn_dir / "synthetic_m2_scores.csv")
 
+    scan_path = syn_dir / "synthetic_m2_scan.csv" if keep_intermediate else syn_dir / "_synthetic_m2_scan.tmp.csv"
     syn_scan = build_m2_scan(
         syn_scores,
         out,
         _scan_cfg_fast(cfg),
         score_rank_col="minute_mismatch_rank",
-        output_path=syn_dir / "synthetic_m2_scan.csv",
+        output_path=scan_path,
         merge_base_pred=False,
     )
+    if not keep_intermediate:
+        _remove_if_exists(scan_path)
+        _remove_if_exists(syn_dir / "synthetic_m2_scan.csv")
 
     rows = []
     if not intervals.empty:
@@ -1150,6 +1170,11 @@ def _fmt(value):
 
 
 def write_evaluation_report(out, eval_dir, cfg):
+    eval_cfg = cfg.get("eval_robustness", {}) if cfg else {}
+    syn_cfg = eval_cfg.get("synthetic", {})
+    topk = _topk(eval_cfg)
+    families = _families(eval_cfg)
+    signals = _signals(eval_cfg)
     fam = _read_csv(Path(eval_dir) / "family_ablation_summary.csv")
     agg = _read_csv(Path(eval_dir) / "aggregation_sensitivity_summary.csv")
     bal = _read_csv(Path(eval_dir) / "evidence_balance_summary.csv")
@@ -1165,38 +1190,47 @@ def write_evaluation_report(out, eval_dir, cfg):
     rec_med = pd.to_numeric(rec.get("iou"), errors="coerce").median() if not rec.empty else np.nan
 
     lines = [
-        "# Evaluation Robustness Report",
+        "# 평가 안정성 리포트",
         "",
         REPORT_REQUIRED_SENTENCE,
         "",
-        "## 1. Why no supervised accuracy?",
-        "No actual review target labels are available in this project, so this module does not compute supervised accuracy, precision, recall, ROC-AUC, or PR-AUC. The outputs are label-free diagnostics for review ranking robustness and synthetic mismatch recovery.",
+        "## 1. 감독학습 성능지표를 쓰지 않는 이유",
+        "현재 프로젝트에는 실제 최종 판정 라벨이 없으므로 accuracy, precision, recall, ROC-AUC, PR-AUC를 실제 성능처럼 계산하지 않는다.",
+        "이 폴더의 산출물은 label-free review ranking의 안정성과 synthetic mismatch 회수 여부를 확인하는 진단 자료다.",
+        "요약 문구의 not real viewbot performance는 synthetic 결과가 실제 viewbot 성능평가가 아니라는 제한을 명시하기 위한 표현이다.",
         "",
-        "## 2. Family ablation",
-        f"The family ablation table removes one family at a time and recomputes the candidate order using the remaining family strengths. The minimum top100 overlap is {_fmt(fam_min)}.",
-        "High overlap supports the claim that the final review order is not an arbitrary single-family combination; low overlap is reported as ranking sensitivity and identifies core evidence.",
+        "## 2. 설정 스냅샷",
+        f"- topk 기준: {topk}",
+        f"- family 목록: {', '.join(map(str, families))}",
+        f"- minute signal 목록: {', '.join(map(str, signals))}",
+        f"- synthetic 입력: minutes={syn_cfg.get('external_minutes_csv')}, intervals={syn_cfg.get('external_intervals_csv')}",
+        f"- synthetic 중간 CSV 보존 여부: {bool(syn_cfg.get('keep_intermediate', False))}",
         "",
-        "## 3. Aggregation sensitivity",
-        f"Aggregation variants compare consensus-only, RRA-only, consensus-plus-RRA, median, trimmed mean, and family-exclusion variants. The minimum top100 overlap is {_fmt(agg_min)}.",
-        "RRA is documented here as rank aggregation evidence. The main interpretation remains consensus-first, with RRA used as supporting evidence.",
+        "## 3. Family 제거 민감도",
+        f"각 family를 하나씩 제거한 뒤 남은 family strength로 후보 순서를 다시 계산한다. 최소 top100 overlap은 {_fmt(fam_min)}이다.",
+        "overlap이 높으면 최종 review_order가 특정 family 하나에만 임의로 의존하지 않는다는 근거가 된다. 낮은 값은 핵심 근거 family를 식별하는 민감도 신호로만 해석한다.",
         "",
-        "## 4. Evidence balance and tie audit",
-        f"Evidence balance is summarized across review-order buckets. Tie audit rows: {len(tie)}.",
-        "Higher strong-family counts in top buckets indicate support from multiple evidence families. Single-family dominance is reported as a limitation when present.",
+        "## 4. 집계 방식 민감도",
+        f"consensus-only, RRA-only, consensus-plus-RRA, median, trimmed mean, family-exclusion 변형을 비교한다. 최소 top100 overlap은 {_fmt(agg_min)}이다.",
+        "RRA는 순위 집계 근거이며, 주 해석은 consensus-first이고 RRA는 보조 근거로 사용한다.",
         "",
-        "## 5. Minute signal sensitivity",
-        f"Signal-removal minimum top100 session overlap is {_fmt(sig_min)}; weight-variant minimum top100 session overlap is {_fmt(weight_min)}.",
-        "Equal weighting is a conservative label-free design to avoid learned weights without labels. Stable overlaps indicate that the minute score is not overdependent on one signal or one weight setting.",
+        "## 5. 근거 균형과 동점 점검",
+        f"Evidence balance는 review_order 구간별로 요약한다. tie audit 행 수는 {len(tie)}개다.",
+        "상위 구간에서 strong-family 수가 높으면 여러 근거 family가 함께 지지한다는 의미다. 단일 family 지배가 있으면 제한사항으로 보고한다.",
         "",
-        "## 6. Synthetic mismatch interval recovery",
-        f"Synthetic interval recovery median IoU is {_fmt(rec_med)}. This is synthetic mismatch recovery, not real viewbot performance.",
-        "Continuous mismatch scenarios are interpreted as sanity checks for interval localization. Intermittent zero controls are reported separately as negative-control-like diagnostics.",
+        "## 6. Minute signal 민감도",
+        f"signal 제거 실험의 최소 top100 session overlap은 {_fmt(sig_min)}이고, weight 변형의 최소 top100 session overlap은 {_fmt(weight_min)}이다.",
+        "equal weight는 라벨 없는 상태에서 학습 가중치를 임의로 만들지 않기 위한 보수적 설계다. overlap 안정성은 minute score가 하나의 signal 또는 하나의 가중치 설정에 과도하게 의존하지 않는지 확인한다.",
         "",
-        "## 7. Limitations",
-        "These diagnostics do not establish supervised class correctness. They test whether review priority is robust to evidence-family removal, aggregation choices, minute-signal removal, and synthetic interval localization.",
+        "## 7. Synthetic mismatch interval 회수",
+        f"Synthetic interval recovery의 median IoU는 {_fmt(rec_med)}이다. 이 값은 synthetic mismatch recovery이며 not real viewbot performance이다.",
+        "연속 mismatch scenario는 interval localization sanity check로 해석한다. intermittent zero control은 별도 negative-control-like diagnostic으로 보고한다.",
         "",
-        "## 8. Recommended interpretation",
-        "Use final review_order as a manual review priority generated by a label-free mismatch pipeline. Use this evaluation folder as robustness evidence and as a record of sensitivity limits.",
+        "## 8. 해석 제한",
+        "이 진단은 supervised class correctness를 증명하지 않는다. evidence-family 제거, 집계 방식 변경, minute-signal 제거, synthetic interval localization에 대해 review 우선순위가 얼마나 안정적인지 확인한다.",
+        "",
+        "## 9. 권장 해석",
+        "최종 review_order는 label-free mismatch pipeline이 만든 수동 검토 우선순위로 사용한다. 이 eval 폴더는 robustness 근거와 민감도 한계를 기록하는 appendix로 해석한다.",
     ]
     _write_text(Path(eval_dir) / "evaluation_report.md", "\n".join(lines))
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import shutil
 import warnings
 import numpy as np
@@ -21,6 +22,17 @@ def _save(fig, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+def _replace_with_hardlink_or_copy(src, dst):
+    src = Path(src)
+    dst = Path(dst)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 def _blank(path, msg):
@@ -412,7 +424,7 @@ def _plot_mc(out, plots):
         a.grid(alpha=0.25)
     fig.suptitle("08 분 단위 행동 상태 군집 요약", fontsize=14)
     _save(fig, plots / "08_mc.png")
-    shutil.copy2(plots / "08_mc.png", plots / "08_cluster_minute.png")
+    _replace_with_hardlink_or_copy(plots / "08_mc.png", plots / "08_cluster_minute.png")
 
 
 def _heatmap(ax, df, value, title):
