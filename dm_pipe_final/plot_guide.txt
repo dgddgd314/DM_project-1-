@@ -1,24 +1,22 @@
-plot guide
+Plot Guide
 ==========
 
-원칙
-- 중간발표 EDA_process에서 쓰던 발표용 스타일을 유지한다.
-- 불필요한 overlay/map 중복 파일은 만들지 않는다.
-- 실제 발표에서 바로 쓸 수 있는 요약 plot만 out/plots/에 저장한다.
-- 공통 review map 좌표: x=median_viewer(log scale), y=median_gap.
-- 공통 review map 스타일: color=zero_chat_rate, cmap=viridis, size=max_gap, 후보=red edge.
-- clustering map 스타일: x=median_viewer(log scale), y=median_gap, size=max_zero_run, color=cluster label.
+Method 2 plots:
+- 01_data_quality.png: data quality and filtering overview.
+- 02_dist_time.png: minute distribution and time structure.
+- 03_view_chat.png: viewer-chat dynamics.
+- 04_cluster_session.png: session-cluster handoff check, not a Method 2 label.
+- 07_ms.png: Method 2 rule-rank score distribution.
+- 08_mc.png: KMeans minute cluster profile.
+- 10_sens.png: threshold-grid sensitivity.
+- 11_ep.png: example Method 2 episodes.
+- 12_m2_rank.png: candidate-session ranking metrics.
+- 13_m2_pipe.png: Method 2 pipeline overview.
+- 15_null.png: observed episode persistence compared with shuffled within-session null.
+- 16_state.png: minute cluster state transition and dwell-time diagnostics.
+- 17_mc_stab.png: KMeans minute cluster stability across seeds/subsamples.
 
-저장되는 plot
-- 01_data_quality.png: session filtering, non-zero chat ratio, zero-run, viewer decile zero-chat.
-- 02_dist_time.png: gap/chat 분포와 viewer/gap session trajectory.
-- 03_view_chat.png: viewer-chat level coupling, 1-minute delta, lag response.
-- 04_cluster.png: KMeans selection/map/profile + GMM/HDBSCAN 구조 확인.
-- 05_detectors.png: IsolationForest, LOF, OneClassSVM 후보를 한 화면에 비교.
-- 06_models.png: AutoEncoder, Synthetic SVM, XGBoost, LightGBM 후보를 한 화면에 비교.
-- 07_pu.png: manual positive label이 있을 때만 PU score map 저장.
-
-주의
-- 빨간 테두리는 확정 뷰봇 라벨이 아니라 해당 알고리즘의 후보 신호이다.
-- PU score가 없으면 blank plot을 만들지 않는다. score.txt와 scores_model.csv에서 상태만 확인한다.
-- 실제 clustering은 6개 feature에서 수행되고, 산점도는 해석용 2D projection이다.
+Notes:
+- Threshold quantiles and durations are a sensitivity grid, not selected truth cutoffs.
+- Plots 15, 16, and 17 are no-label diagnostics, not viewbot performance metrics.
+- Detector/model comparison plots are not part of the final Method 2 handoff.

@@ -42,6 +42,8 @@ class CrawlManager:
             initial_streams = self.live_api.discover_target_lives(target_user_ids)
             self._sync_chat_collectors(initial_streams)
 
+            next_export_at = started_at + timedelta(seconds=self.settings.export_interval_seconds)
+
             while (datetime.now() - started_at).total_seconds() < self.duration_seconds:
                 now = datetime.now()
                 if now >= next_snapshot_at:
@@ -49,11 +51,27 @@ class CrawlManager:
                     self._save_live_snapshots(run_id, streams)
                     self._sync_chat_collectors(streams)
                     next_snapshot_at = now + timedelta(seconds=self.settings.snapshot_interval_seconds)
+
+                if now >= next_export_at:
+                    logger.info("Performing periodic real-time data aggregation and export...")
+                    try:
+                        # 1. Aggregate current minute features up to now
+                        feature_rows = build_minute_features_for_run(run_id)
+                        logger.info(f"Aggregated {feature_rows} minute feature rows for run_id={run_id}")
+                        
+                        # 2. Export accumulated data to disk
+                        self._export_current_data(run_id)
+                    except Exception as e:
+                        logger.exception(f"Failed to perform periodic aggregation/export for run_id={run_id}: {e}")
+                    
+                    next_export_at = now + timedelta(seconds=self.settings.export_interval_seconds)
+
                 time.sleep(1)
 
             self._shutdown_collectors()
-            logger.info("Aggregating minute features...")
+            logger.info("Aggregating final minute features...")
             feature_rows = build_minute_features_for_run(run_id)
+            self._export_current_data(run_id)
             self._finish_run(run_id, status="success", notes=f"minute_features={feature_rows}")
             logger.info(f"Run finished successfully run_id={run_id}")
 
@@ -152,3 +170,41 @@ class CrawlManager:
         if self.chat_sink:
             self.chat_sink.stop()
             self.chat_sink = None
+
+    def _export_current_data(self, run_id: int) -> None:
+        import pandas as pd
+        from sqlalchemy import create_engine
+        import os
+
+        # Determine the exports directory at project root
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        export_dir = os.path.join(project_root, "exports")
+        os.makedirs(export_dir, exist_ok=True)
+
+        engine = create_engine(self.settings.sqlalchemy_url)
+
+        # 1. Export Minute Features to Excel
+        features_file = os.path.join(export_dir, f"Run_{run_id}_Features.xlsx")
+        try:
+            feat_query = f"SELECT * FROM minute_features WHERE run_id = {run_id}"
+            feat_df = pd.read_sql(feat_query, engine)
+            if not feat_df.empty:
+                feat_df.to_excel(features_file, index=False)
+                logger.info(f"Periodically exported {len(feat_df)} minute features to {features_file}")
+            else:
+                logger.warning(f"No minute features found in DB to export for run_id={run_id}")
+        except Exception as e:
+            logger.error(f"Failed to export minute features to Excel: {e}", exc_info=True)
+
+        # 2. Export Chat Messages to CSV (UTF-8 with BOM for Excel Korean/Vietnamese letters)
+        chats_file = os.path.join(export_dir, f"Run_{run_id}_Chats.csv")
+        try:
+            chat_query = f"SELECT * FROM chat_messages_raw WHERE run_id = {run_id}"
+            chat_df = pd.read_sql(chat_query, engine)
+            if not chat_df.empty:
+                chat_df.to_csv(chats_file, index=False, encoding='utf-8-sig')
+                logger.info(f"Periodically exported {len(chat_df)} chat messages to {chats_file}")
+            else:
+                logger.warning(f"No chat messages found in DB to export for run_id={run_id}")
+        except Exception as e:
+            logger.error(f"Failed to export chat messages to CSV: {e}", exc_info=True)

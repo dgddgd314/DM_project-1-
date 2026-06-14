@@ -4,6 +4,45 @@ from .detect import FEATS as DETECTOR_FEATS
 from .model import FEATS as MODEL_FEATS, MODEL_SCORE_COLS
 
 
+FINAL_SENTENCE = (
+    "This project does not have platform-internal labels that confirm actual viewbot use. "
+    "It uses observable viewer count and chat activity to score one-minute viewer-chat mismatch states, "
+    "groups contiguous high-scoring minutes into episode candidates, and ranks sessions for human review. "
+    "The final outputs are review aids, not ground-truth labels and not probability."
+)
+
+
+SCORE_EXPLANATION = [
+    "## Score Interpretation",
+    "",
+    "- `minute_mismatch_score` is not probability.",
+    "- Each signal is converted to a percentile rank before aggregation.",
+    "- The score does not average raw values directly; rank conversion puts differently scaled signals on a common scale.",
+    "- There is no real target label, so weights are not learned from ground truth.",
+    "- Equal-weight rank aggregation is a transparent baseline review index, not the final model.",
+]
+
+EPISODE_EXPLANATION = [
+    "## Episode Definition",
+    "",
+    "- An episode is a time-contiguous interval of high viewer-chat mismatch score inside one session.",
+    "- An episode is not a confirmed viewbot-active interval.",
+    "- An episode candidate is an interval for a reviewer to inspect.",
+    "- `min_duration` and `threshold_q` are calibration candidates, not answer cutoffs.",
+]
+
+MODEL_IO_EXPLANATION = [
+    "## Model Input / Output Separation",
+    "",
+    "- `session_summary_processed.csv` contains session-level behavior features and legacy baseline scores for review and modeling handoff.",
+    "- `session_review_summary.csv` is a rule-based review ranking output.",
+    "- Ranking outputs must not be fed back as model input because that would leak the review target into the feature matrix.",
+    "- `overall_session_review_rank_score` and `overall_session_review_rank` must not be used as model features.",
+    "- Use `X_core_cols.txt` for recommended model input columns.",
+    "- Use `X_no_leak_cols.txt` for columns to exclude from model input.",
+]
+
+
 def _get(cfg, *keys, default=None):
     cur = cfg
     for key in keys:
@@ -28,14 +67,193 @@ def _value_counts(df, col):
     return ", ".join(f"{k}:{v}" for k, v in vc.items())
 
 
-def write_score_doc(out, cfg=None, session_df=None, syn_train=None, model_scores=None, session_model=None):
-    """Write an execution-specific algorithm document.
+def _write(path, lines):
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
-    The file records the actual input columns, scaler, output columns, and
-    hyperparameters used by each non-clustering score algorithm. Clustering is
-    still documented separately in out/cluster.txt by src/cluster.py.
-    """
-    # Backward-compatible alias: run.py/min2sess.py pass session_model.
+
+def write_task_docs(out, cfg=None):
+    out = Path(out)
+    cfg = cfg or {}
+    if not _get(cfg, "docs", "write_task_definition", default=True):
+        return
+
+    _write(out / "task_definition.md", [
+        "# Task Definition",
+        "",
+        FINAL_SENTENCE,
+        "",
+        "## Primary Task",
+        "- Primary task: minute-level viewer-chat mismatch episode detection.",
+        "- Input unit: `(run_id, broad_no, minute_ts)`.",
+        "- Episode unit: contiguous mismatch minutes inside the same `(run_id, broad_no)` session.",
+        "- Session unit: `(run_id, broad_no)`.",
+        "- Output policy: review candidate ranking.",
+        "",
+        "## Non-Goals",
+        "- true viewbot confirmation.",
+        "- confirming actual viewbot usage without platform internal logs.",
+        "- using KMeans clusters as ground-truth labels.",
+        "- using `cluster_number`, `minute_cluster`, or `y_syn` as actual labels.",
+        "",
+        *SCORE_EXPLANATION,
+        "",
+        *EPISODE_EXPLANATION,
+        "",
+        *MODEL_IO_EXPLANATION,
+        "",
+        "## Outputs",
+        "- `minute_all.csv`, `minute_model.csv`: raw minute rows without state features, labels, or scores.",
+        "- `minute_all_feat.csv`, `minute_model_feat.csv`: minute rows with state features.",
+        "- `minute_scores.csv`: minute mismatch score and rank for review.",
+        "- `episode_candidates_all_thresholds.csv`: episode candidate intervals under calibration thresholds.",
+        "- `threshold_calibration.csv`: sensitivity table for threshold and duration candidates.",
+        "- `session_review_candidates.csv`: session-level review candidates by calibration setting.",
+        "- `session_review_summary.csv`: session-level review ranking output.",
+    ])
+
+    _write(out / "data_dictionary.md", [
+        "# Data Dictionary",
+        "",
+        "## Raw Minute Columns",
+        "- `source_file`: source workbook file name.",
+        "- `run_id`, `broad_no`, `session_key`: session identifiers.",
+        "- `user_id`, `category_id`: broadcast metadata when available.",
+        "- `minute_ts`: minute timestamp after configured timezone shift.",
+        "- `viewer_count_last`: last observed viewer count in the minute.",
+        "- `chat_count`: number of chat messages in the minute.",
+        "- `unique_chatters`: number of unique chatters in the minute.",
+        "- `avg_msg_len`: average message length; zero-chat structural missing values are filled as 0.",
+        "- `repeat_msg_ratio`: repeated-message ratio in the minute.",
+        "- `new_chatter_ratio`: new chatter ratio in the minute.",
+        "- `chat_per_viewer`: chat count divided by viewer count when viewer count is positive.",
+        "- `delta_viewer_1m`, `delta_chat_1m`: within-session one-minute changes.",
+        "",
+        "## Minute State Features",
+        "- `minute_idx`: time-order index inside `(run_id, broad_no)`.",
+        "- `log_viewer`, `log_chat`, `log_unique`: log1p transforms for skewed counts.",
+        "- `viewer_chat_gap`: `log_viewer - log_chat`; high values mean weaker chat response for scale.",
+        "- `viewer_unique_gap`: `log_viewer - log_unique`; high values mean fewer unique chatters for scale.",
+        "- `zero_chat`: whether chat_count is zero.",
+        "- `zero_run_len`: consecutive zero-chat length inside the same session.",
+        "- `viewer_bin`: scale bin for comparing minutes with similar viewer count.",
+        "- `expected_log_chat_bin`, `expected_log_unique_bin`: median response within viewer_bin.",
+        "- `chat_deficit`, `unique_deficit`: expected response minus observed response.",
+        "- `rolling_*`: current-and-past rolling summaries; no future minutes are used.",
+        "",
+        "## Behavior Cluster Features",
+        "- `cluster_number`: session-level behavior cluster id; categorical feature, not target label.",
+        "- `session_behavior_cluster`: alias for cluster_number; use only with one-hot encoding if needed.",
+        "- `minute_cluster`: minute-level behavior cluster id, not a label.",
+        "- `cluster_mismatch_rank`: cluster-level mismatch indicator rank; interpretation aid only.",
+        "",
+        *SCORE_EXPLANATION,
+        "",
+        *EPISODE_EXPLANATION,
+        "",
+        "## Session Review Outputs",
+        "- `episode_duration_ratio`: total candidate duration divided by observed session length.",
+        "- `max_episode_score`: strongest candidate interval score in the session.",
+        "- `p95_minute_mismatch_score`: session-level tail of minute mismatch scores.",
+        "- `session_review_rank_score`: equal average of percentile ranks for one calibration setting.",
+        "- `session_review_rank`: percentile rank of session_review_rank_score.",
+        "- `review_stability`: share of calibration settings where the session appears as a review candidate.",
+        "- `overall_session_review_rank_score`, `overall_session_review_rank`: review output only, not model input.",
+        "- `session_bucket`: `no_episode`, `review_candidate`, or `recommended_setting_candidate`; not a label.",
+        "",
+        "## Synthetic Sanity-Check Fields",
+        "- `y_syn`: artificial injection label used only for sanity checks and legacy auxiliary scores.",
+        "- `y_syn` is not ground-truth label.",
+    ])
+
+    _write(out / "modeling_handoff.md", [
+        "# Modeling Handoff",
+        "",
+        FINAL_SENTENCE,
+        "",
+        *MODEL_IO_EXPLANATION,
+        "",
+        "## Recommended Input Columns",
+        "- Use `X_core_cols.txt` as the session-level starting feature list.",
+        "- `cluster_number` may be used as a categorical behavior feature, not as a target.",
+        "- `session_behavior_cluster` is an alias and should be one-hot encoded only if used.",
+        "",
+        "## Forbidden As Model Inputs",
+        "- Do not use `overall_session_review_rank_score` or `overall_session_review_rank` as model features.",
+        "- Do not use `session_review_rank_score`, `session_review_rank`, or `session_bucket` as model features.",
+        "- Do not use `minute_mismatch_score`, `minute_mismatch_rank`, `episode_count`, or `episode_duration_ratio` as model features.",
+        "- Do not use `minute_cluster` as a target label.",
+        "- Do not use `y_syn` as an actual label.",
+        "",
+        "## Completed",
+        "- Raw minute CSVs are separated from feature minute CSVs.",
+        "- Minor off-window boundary rows are trimmed when below the configured tolerance.",
+        "- Larger wrong-window files still drop at file level.",
+        "- Minute-level mismatch scoring, episode candidates, and session review ranking are generated.",
+        "",
+        "## Modeling Owner Should Do",
+        "- Treat this as review ranking or episode detection, not a true binary classifier.",
+        "- Inspect `threshold_calibration.csv` before choosing any presentation setting.",
+        "- Use `synthetic_intervals.csv`, when present, only for episode-recovery sanity checks.",
+        "- Report ranking-oriented behavior, not only accuracy.",
+        "",
+        "## Modeling Owner Must Not Do",
+        "- Do not create a definitive `viewbot_probability` column.",
+        "- Do not create `true_viewbot_label` or `bot_detected` columns.",
+        "- Do not claim confirmed viewbot usage from behavior clusters or review scores.",
+        "",
+        "## Key Files",
+        "- `minute_all.csv`, `minute_model.csv`: raw minute rows.",
+        "- `minute_all_feat.csv`, `minute_model_feat.csv`: minute state-feature rows.",
+        "- `session_summary_processed.csv`: session behavior features, cluster_number, and legacy baselines.",
+        "- `session_review_summary.csv`: rule-based review ranking output.",
+        "- `X_core_cols.txt`, `X_no_leak_cols.txt`: model input and no-leak column lists.",
+    ])
+
+    _write(out / "pipeline_definition.md", [
+        "# Pipeline Definition",
+        "",
+        "## Revised Pipeline",
+        "`load_features -> prep_minute -> split raw minute outputs -> add_minute_state_features -> split feature minute outputs -> add_minute_clusters -> build_episode_calibration -> make_session -> legacy session-level baselines -> merge review outputs for handoff`.",
+        "",
+        "## Load Policy",
+        "- `drop_off_window` stays true.",
+        "- `off_window_max_rate` is a data-cleaning tolerance, not a viewbot threshold.",
+        "- Files with small boundary overruns are kept after trimming only the off-window rows.",
+        "- Files with larger off-window rates are wrong-window collections and are dropped.",
+        "",
+        "## Raw Versus Feature Minute Files",
+        "- `minute_all.csv`, `minute_model.csv`, and `qc_zero.csv` contain raw minute rows only.",
+        "- `minute_all_feat.csv`, `minute_model_feat.csv`, and `qc_zero_feat.csv` contain state features.",
+        "",
+        *SCORE_EXPLANATION,
+        "",
+        *EPISODE_EXPLANATION,
+        "",
+        *MODEL_IO_EXPLANATION,
+        "",
+        "## Legacy Baselines",
+        "Existing session-level cluster, detector, synthetic, and model scores remain as legacy session-level baselines. They should be interpreted as auxiliary review signals.",
+    ])
+
+    _write(out / "final_task_slide_plan.md", [
+        "# Final Task Slide Plan",
+        "",
+        "1. Feedback and task reset",
+        "2. Input / Output definition",
+        "3. Minute state features",
+        "4. 07_ms.png: minute score distribution",
+        "5. 08_mc.png: minute behavior cluster",
+        "6. 09_sc.png: session cluster vs review score",
+        "7. 10_cal.png: threshold calibration",
+        "8. 11_ep.png: episode examples",
+        "9. 12_rank.png: session review ranking",
+        "10. 13_pipe.png: final pipeline",
+        "11. Legacy baseline as appendix",
+        "12. Limits and handoff",
+    ])
+
+
+def write_score_doc(out, cfg=None, session_df=None, syn_train=None, model_scores=None, session_model=None):
     if session_df is None and session_model is not None:
         session_df = session_model
 
@@ -43,166 +261,35 @@ def write_score_doc(out, cfg=None, session_df=None, syn_train=None, model_scores
     out.mkdir(parents=True, exist_ok=True)
     n_session = _nrows(session_df)
     n_train = _nrows(syn_train)
-    n_features_detector = len(DETECTOR_FEATS)
-    n_features_model = len(MODEL_FEATS)
-
-    contam = float(_get(cfg, "detector", "contam", default=0.05))
-    detector_seed = int(_get(cfg, "detector", "seed", default=42))
-    model_seed = int(_get(cfg, "model", "seed", default=42))
-    test_size = float(_get(cfg, "model", "test_size", default=0.25))
-    syn_seed = int(_get(cfg, "synthetic", "seed", default=42))
-    n_per_type = int(_get(cfg, "synthetic", "n_per_type", default=50))
-    label_file = _get(cfg, "path", "label_file", default="data/labels/manual_labels.csv")
-    prep_min_n = int(_get(cfg, "prep", "min_n", default=10))
-
-    lof_neighbors = "not run"
-    if n_session >= 5:
-        lof_neighbors = min(20, n_session - 1)
-
-    ae_hidden = "not run"
-    if n_session >= 5:
-        ae_hidden = max(2, min(8, n_features_model // 2 + 1))
-
     syn_counts = _value_counts(syn_train, "y_syn")
     score_cols_present = []
     if model_scores is not None:
         score_cols_present = [c for c in MODEL_SCORE_COLS if c in model_scores.columns]
 
     lines = [
-        "점수/모델 자동 설정 기록",
-        "=========================",
-        "이 파일은 run.py 실행 시 현재 cfg.yml과 실제 입력 row 수를 기준으로 자동 생성됨",
-        "클러스터링 자체의 KMeans/GMM/HDBSCAN 설정은 out/cluster.txt에 별도 저장됨.",
+        "Legacy Session-Level Score Document",
+        "===================================",
+        "These outputs are legacy session-level baselines, not the primary task output.",
+        "The primary task is minute-level viewer-chat mismatch episode detection.",
         "",
-        "공통 입력 데이터",
-        "--------------",
-        "분석 단위: session = run_id + broad_no",
-        f"score 입력 session 수: {n_session}",
-        f"synthetic supervised train row 수: {n_train}",
-        f"synthetic train y_syn 분포: {syn_counts}",
-        "결측/무한대 처리: feature별 inf/-inf를 NaN으로 바꾼 뒤 median으로 채우고, 그래도 남으면 0으로 채움.",
-        "점수 방향: *_score는 값이 클수록 이상 후보 가능성이 크도록 저장한다.",
-        "rank 컬럼: 각 score의 percentile rank이며 최종 ensemble score가 아니다.",
+        f"session score input rows: {n_session}",
+        f"synthetic train rows: {n_train}",
+        f"synthetic y_syn distribution: {syn_counts}",
         "",
-        "1) IsolationForest",
-        "-------------------",
-        "목적: 세션 단위 비지도 이상 후보 탐지",
-        "입력 데이터: eligible session_model",
-        f"입력 feature: {_join(DETECTOR_FEATS)}",
-        "스케일러: RobustScaler",
-        "모델 입력값: RobustScaler.fit_transform(detector_features)",
-        "출력 컬럼: if_lab, if_score, if_score_rank",
-        f"hyperparameter: n_estimators=200, contamination={contam}, random_state={detector_seed}",
-        "score 계산: -IsolationForest.decision_function(X_scaled)",
+        "Unsupervised detector features:",
+        f"- {_join(DETECTOR_FEATS)}",
+        "Model score features:",
+        f"- {_join(MODEL_FEATS)}",
         "",
-        "2) LocalOutlierFactor",
-        "----------------------",
-        "목적: 밀도 기반 비지도 이상 후보 탐지",
-        "입력 데이터: eligible session_model",
-        f"입력 feature: {_join(DETECTOR_FEATS)}",
-        "스케일러: RobustScaler",
-        "모델 입력값: RobustScaler.fit_transform(detector_features)",
-        "출력 컬럼: lof_lab, lof_score, lof_score_rank",
-        f"hyperparameter: n_neighbors={lof_neighbors}, contamination={contam}",
-        "score 계산: -LocalOutlierFactor.negative_outlier_factor_",
+        "Current model score columns:",
+        f"- {_join(score_cols_present) if score_cols_present else 'not available'}",
         "",
-        "3) OneClassSVM",
-        "----------------",
-        "목적: RBF boundary 기반 비지도 이상 후보 탐지",
-        "입력 데이터: eligible session_model",
-        f"입력 feature: {_join(DETECTOR_FEATS)}",
-        "스케일러: RobustScaler",
-        "모델 입력값: RobustScaler.fit_transform(detector_features)",
-        "출력 컬럼: ocsvm_lab, ocsvm_score, ocsvm_score_rank",
-        f"hyperparameter: kernel='rbf', gamma='scale', nu={contam}",
-        "score 계산: -OneClassSVM.decision_function(X_scaled)",
-        "",
-        "4) AutoEncoder reconstruction score",
-        "-----------------------------------",
-        "목적: 라벨 없이 정상/이상 cutoff를 만들지 않고 세션 재구성오차를 개별 score로 저장",
-        "입력 데이터: eligible session_model",
-        f"입력 feature: {_join(MODEL_FEATS)}",
-        "스케일러: RobustScaler",
-        "모델 입력값: RobustScaler.fit_transform(model_features)",
-        "출력 컬럼: ae_score, ae_score_rank",
-        f"hyperparameter: MLPRegressor(hidden_layer_sizes=({ae_hidden},), activation='relu', max_iter=300, random_state={model_seed})",
-        "score 계산: scaled input과 reconstructed input의 row-wise mean squared error",
-        "",
-        "5) Synthetic anomaly generation",
-        "-------------------------------",
-        "목적: 실제 뷰봇 라벨이 없을 때, 명시적 이상 시나리오를 주입한 보조 supervised score 생성",
-        "입력 데이터: minute_model과 eligible session_model",
-        f"eligible base 조건: session_model 기준, 각 base session은 최소 {prep_min_n} minute 이상이어야 주입 가능",
-        "주입 공통 절차: base session 선택 -> 연속 minute 구간 수정 -> minute 파생변수 재계산 -> session feature 재요약",
-        "주입 시나리오: hi_view_low_chat, silent_run, view_spike_no_chat",
-        "hi_view_low_chat: viewer 증가 + chat/unique 급감",
-        "silent_run: 연속 구간 chat/unique/message 관련 값 0 처리",
-        "view_spike_no_chat: viewer 급등 + chat/unique는 약하게만 변화",
-        f"hyperparameter: seed={syn_seed}, n_per_type={n_per_type}",
-        "출력 파일: syn_minute.csv, syn_train.csv, synthetic_injection.txt",
-        "세부 injection 범위와 생성 row 수는 out/synthetic_injection.txt에 자동 저장",
-        "",
-        "6) Synthetic SVM",
-        "----------------",
-        "목적: synthetic anomaly scenario에 가까운 세션 점수화",
-        "입력 데이터: syn_train(real y_syn=0 + synthetic y_syn=1)",
-        f"입력 feature: {_join(MODEL_FEATS)}",
-        "스케일러: RobustScaler inside sklearn Pipeline",
-        "모델 입력값: raw model_features -> RobustScaler -> SVC",
-        "출력 컬럼: svm_syn_score, svm_syn_score_rank",
-        f"train/test split: test_size={test_size}, random_state={model_seed}, stratify=y_syn",
-        f"hyperparameter: SVC(kernel='rbf', C=1.0, gamma='scale', probability=True, class_weight='balanced', random_state={model_seed})",
-        "score 계산: predict_proba(real_sessions)[:, 1]",
-        "",
-        "7) Synthetic XGBoost",
-        "--------------------",
-        "목적: tree boosting 기반 synthetic anomaly scenario 점수화",
-        "입력 데이터: syn_train(real y_syn=0 + synthetic y_syn=1)",
-        f"입력 feature: {_join(MODEL_FEATS)}",
-        "스케일러: 사용하지 않음(tree model)",
-        "모델 입력값: median/0 filled model_features",
-        "출력 컬럼: xgb_syn_score, xgb_syn_score_rank",
-        f"train/test split: test_size={test_size}, random_state={model_seed}, stratify=y_syn",
-        f"hyperparameter: n_estimators=60, max_depth=3, learning_rate=0.07, subsample=0.9, colsample_bytree=0.9, eval_metric='logloss', random_state={model_seed}, n_jobs=1, verbosity=0",
-        "score 계산: predict_proba(real_sessions)[:, 1]",
-        "",
-        "8) Synthetic LightGBM",
-        "----------------------",
-        "목적: gradient boosting 기반 synthetic anomaly scenario 점수화",
-        "입력 데이터: syn_train(real y_syn=0 + synthetic y_syn=1)",
-        f"입력 feature: {_join(MODEL_FEATS)}",
-        "스케일러: 사용하지 않음(tree model)",
-        "모델 입력값: median/0 filled model_features",
-        "출력 컬럼: lgb_syn_score, lgb_syn_score_rank",
-        f"train/test split: test_size={test_size}, random_state={model_seed}, stratify=y_syn",
-        f"hyperparameter: n_estimators=60, learning_rate=0.07, num_leaves=15, subsample=0.9, colsample_bytree=0.9, random_state={model_seed}, verbose=-1, n_jobs=1",
-        "score 계산: predict_proba(real_sessions)[:, 1]",
-        "",
-        "9) PU-style LogisticRegression bagging",
-        "-------------------------------------",
-        "목적: manual positive label이 있을 때만 positive-unlabeled 방식의 보조 score 생성",
-        f"label 파일: {label_file}",
-        "label 파일 필요 컬럼: session_key, label",
-        "positive 정의: label == 1",
-        "입력 데이터: eligible session_model + manual positive label",
-        f"입력 feature: {_join(MODEL_FEATS)}",
-        "스케일러: RobustScaler inside sklearn Pipeline",
-        "모델 입력값: raw model_features -> RobustScaler -> LogisticRegression",
-        "출력 컬럼: pu_score, pu_score_rank",
-        f"bagging 반복: 30회, 각 반복 negative sample 수=min(n_unlabeled, max(n_positive*3, 10)), random_state={model_seed}",
-        f"hyperparameter: LogisticRegression(max_iter=1000, class_weight='balanced', random_state={model_seed})",
-        "score 계산: 30회 predict_proba(real_sessions)[:, 1] 평균",
-        "생성 조건: manual label 파일이 없거나 positive가 부족하면 pu_score는 NaN",
-        "",
-        "현재 model score 컬럼",
-        "----------------------",
-        f"생성된 model score 컬럼: {_join(score_cols_present) if score_cols_present else 'not available'}",
-        f"기본 model score 후보: {_join(MODEL_SCORE_COLS)}",
-        "",
-        "주의",
-        "----",
-        "cluster_number는 KMeans 세션 행동 유형 번호이며 뷰봇 정답 라벨이 아니다.",
-        "본 코드에서는 review_score/final_score/ensemble_score처럼 여러 알고리즘을 결합한 최종 점수를 만들지 않는다.",
+        "Important interpretation rules:",
+        "- `cluster_number` and `session_behavior_cluster` are behavior cluster ids, not labels.",
+        "- `y_syn` is an artificial mismatch injection label for synthetic sanity checks only.",
+        "- Do not interpret any score as confirmed viewbot usage.",
+        "- Do not feed review ranking outputs back into model input features.",
+        "- Use review candidate, review ranking, mismatch episode, and legacy session-level baseline wording.",
     ]
-
     (out / "score.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_task_docs(out, cfg)

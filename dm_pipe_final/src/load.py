@@ -36,8 +36,8 @@ def _in_window(mins, start, end, tol):
     return (mins >= start) | (mins <= end)
 
 
-def window_check(ts, cfg):
-    ts = pd.to_datetime(ts, errors="coerce").dropna()
+def window_mask(ts, cfg):
+    ts = pd.to_datetime(ts, errors="coerce")
     windows = cfg.get("time", {}).get(
         "valid_windows",
         ["14:00-16:00", "17:00-19:00", "20:00-22:00", "23:00-01:00"],
@@ -46,27 +46,47 @@ def window_check(ts, cfg):
 
     if ts.empty:
         return {
+            "best_mask": pd.Series(False, index=ts.index, dtype=bool),
             "time_ok": 0,
             "time_window": "no_valid_time",
             "off_window_rows": 0,
             "off_window_rate": np.nan,
         }
 
-    mins = _min_of_day(ts)
-    best_name, best_ok = "off_window", pd.Series(False, index=ts.index)
+    valid = ts.notna()
+    if not valid.any():
+        return {
+            "best_mask": pd.Series(False, index=ts.index, dtype=bool),
+            "time_ok": 0,
+            "time_window": "no_valid_time",
+            "off_window_rows": int(len(ts)),
+            "off_window_rate": 1.0 if len(ts) else np.nan,
+        }
+
+    mins = _min_of_day(ts.loc[valid])
+    best_name = "off_window"
+    best_ok = pd.Series(False, index=ts.index, dtype=bool)
     for w in windows:
         start, end, name = _parse_window(w)
-        ok = _in_window(mins, start, end, tol)
+        ok = pd.Series(False, index=ts.index, dtype=bool)
+        ok.loc[valid] = _in_window(mins, start, end, tol).to_numpy()
         if ok.mean() > best_ok.mean():
             best_name, best_ok = name, ok
 
     off = int((~best_ok).sum())
     return {
+        "best_mask": best_ok,
         "time_ok": int(off == 0),
         "time_window": best_name,
         "off_window_rows": off,
         "off_window_rate": float(off / len(ts)),
     }
+
+
+def window_check(ts, cfg):
+    out = window_mask(ts, cfg).copy()
+    out.pop("best_mask", None)
+    return out
 
 
 def load_features(cfg):
@@ -78,6 +98,8 @@ def load_features(cfg):
     shift_h = int(cfg.get("time", {}).get("shift_hours", 9))
     drop_runs = set(int(x) for x in cfg.get("time", {}).get("drop_runs", []))
     drop_off = bool(cfg.get("time", {}).get("drop_off_window", True))
+    off_window_max = float(cfg.get("time", {}).get("off_window_max_rate", 0.0))
+    trim_off_window = bool(cfg.get("time", {}).get("trim_off_window_rows", False))
     frames, audit = [], []
 
     for file in files:
@@ -100,32 +122,61 @@ def load_features(cfg):
         if run_id is None and len(df):
             run_id = int(df["run_id"].iloc[0])
 
-        w = window_check(df["minute_ts"], cfg)
+        wm = window_mask(df["minute_ts"], cfg)
+        best_mask = wm.pop("best_mask")
         reason = "ok"
         use = len(df) > 0
+        rows_after_basic_clean = len(df)
+        rows_trimmed_off_window = 0
+        off_window_policy = "keep_all"
 
         if run_id in drop_runs:
             use = False
             reason = "dropped_by_run_id"
-        elif drop_off and not bool(w["time_ok"]):
+            off_window_policy = "drop_file"
+        elif rows_after_basic_clean == 0:
             use = False
-            reason = "off_window"
-        elif not use:
             reason = "no_valid_rows"
+            off_window_policy = "drop_file"
+        elif not drop_off:
+            reason = "ok_no_window_filter"
+            off_window_policy = "keep_all"
+        elif int(wm["off_window_rows"]) == 0:
+            reason = "ok"
+            off_window_policy = "keep_all"
+        elif float(wm["off_window_rate"]) <= off_window_max and trim_off_window:
+            rows_trimmed_off_window = int(wm["off_window_rows"])
+            df = df.loc[best_mask].copy()
+            use = len(df) > 0
+            reason = "trim_off_window" if use else "no_valid_rows"
+            off_window_policy = "trim_rows" if use else "drop_file"
+        elif float(wm["off_window_rate"]) > off_window_max:
+            use = False
+            reason = "drop_off_window_major"
+            off_window_policy = "drop_file"
+        else:
+            use = False
+            reason = "drop_off_window_minor_trim_disabled"
+            off_window_policy = "drop_file"
+
+        rows_used_after_trim = len(df) if use else 0
 
         audit.append({
             "file": file.name,
             "use": int(use),
             "rows_raw": rows_raw,
-            "rows_after_basic_clean": len(df),
-            "rows_used": len(df) if use else 0,
+            "rows_after_basic_clean": rows_after_basic_clean,
+            "rows_used": rows_used_after_trim,
+            "rows_trimmed_off_window": rows_trimmed_off_window,
+            "rows_used_after_trim": rows_used_after_trim,
+            "off_window_policy": off_window_policy,
             "run_id": run_id,
             "raw_start": raw_start,
             "raw_end": raw_end,
             "kst_start": df["minute_ts"].min() if len(df) else pd.NaT,
             "kst_end": df["minute_ts"].max() if len(df) else pd.NaT,
             "shift_hours": shift_h,
-            **w,
+            **wm,
             "reason": reason,
         })
         if use:

@@ -17,14 +17,24 @@ def recalc(g):
 
 
 def choose_seg(n, rng, lo, hi):
-    # Target a percentage of the session, but keep at least 3 minutes so the
-    # injected pattern is visible after session-level aggregation.
     min_len = max(3, int(np.floor(lo * n)))
     max_len = max(min_len, int(np.ceil(hi * n)))
     length = int(rng.integers(min_len, max_len + 1))
     length = min(length, n)
     start = int(rng.integers(0, max(1, n - length + 1)))
     return start, start + length
+
+
+def _mark_interval(g, ix, kind, idx):
+    interval_id = f"{kind}_{idx}"
+    start_ts = g.loc[ix, "minute_ts"].min()
+    end_ts = g.loc[ix, "minute_ts"].max()
+    g.loc[ix, "is_injected_minute"] = 1
+    g.loc[ix, "injected_type"] = kind
+    g.loc[ix, "injected_interval_id"] = interval_id
+    g.loc[ix, "injected_start_ts"] = start_ts
+    g.loc[ix, "injected_end_ts"] = end_ts
+    return g
 
 
 def inject(base, kind, idx, rng):
@@ -40,6 +50,11 @@ def inject(base, kind, idx, rng):
     g["session_key"] = g["run_id"].astype(str) + "_" + g["broad_no"].astype(str)
     g["syn_type"] = kind
     g["y_syn"] = 1
+    g["is_injected_minute"] = 0
+    g["injected_type"] = None
+    g["injected_interval_id"] = None
+    g["injected_start_ts"] = pd.NaT
+    g["injected_end_ts"] = pd.NaT
 
     if kind == "hi_view_low_chat":
         a, b = choose_seg(n, rng, 0.30, 0.60)
@@ -47,11 +62,13 @@ def inject(base, kind, idx, rng):
         g.loc[ix, "viewer_count_last"] *= rng.uniform(1.05, 1.50)
         g.loc[ix, "chat_count"] = np.floor(g.loc[ix, "chat_count"] * rng.uniform(0.02, 0.25))
         g.loc[ix, "unique_chatters"] = np.floor(g.loc[ix, "unique_chatters"] * rng.uniform(0.02, 0.30))
+        g = _mark_interval(g, ix, kind, idx)
 
     if kind == "silent_run":
         a, b = choose_seg(n, rng, 0.15, 0.35)
         ix = g.index[a:b]
         g.loc[ix, ["chat_count", "unique_chatters", "avg_msg_len", "repeat_msg_ratio", "new_chatter_ratio"]] = 0
+        g = _mark_interval(g, ix, kind, idx)
 
     if kind == "view_spike_no_chat":
         a, b = choose_seg(n, rng, 0.05, 0.15)
@@ -59,6 +76,7 @@ def inject(base, kind, idx, rng):
         g.loc[ix, "viewer_count_last"] *= rng.uniform(2.0, 4.0)
         g.loc[ix, "chat_count"] = np.floor(g.loc[ix, "chat_count"] * rng.uniform(0.3, 1.0))
         g.loc[ix, "unique_chatters"] = np.floor(g.loc[ix, "unique_chatters"] * rng.uniform(0.3, 1.0))
+        g = _mark_interval(g, ix, kind, idx)
 
     return recalc(g)
 
@@ -70,53 +88,60 @@ def _counts_text(df, col):
     return ", ".join(f"{k}:{v}" for k, v in vc.items())
 
 
+def _save_intervals(syn_min, out):
+    cols = [
+        "injected_interval_id", "injected_type", "session_key", "run_id", "broad_no",
+        "injected_start_ts", "injected_end_ts", "is_injected_minute",
+    ]
+    if syn_min is None or syn_min.empty or "is_injected_minute" not in syn_min.columns:
+        pd.DataFrame(columns=cols).to_csv(out / "synthetic_intervals.csv", index=False, encoding="utf-8-sig")
+        return
+    injected = syn_min.loc[syn_min["is_injected_minute"].eq(1)].copy()
+    if injected.empty:
+        pd.DataFrame(columns=cols).to_csv(out / "synthetic_intervals.csv", index=False, encoding="utf-8-sig")
+        return
+    intervals = (
+        injected.groupby("injected_interval_id")
+        .agg(
+            injected_type=("injected_type", "first"),
+            session_key=("session_key", "first"),
+            run_id=("run_id", "first"),
+            broad_no=("broad_no", "first"),
+            injected_start_ts=("minute_ts", "min"),
+            injected_end_ts=("minute_ts", "max"),
+            injected_minute_count=("is_injected_minute", "sum"),
+        )
+        .reset_index()
+    )
+    intervals.to_csv(out / "synthetic_intervals.csv", index=False, encoding="utf-8-sig")
+
+
 def write_injection_doc(out, cfg, base_n=0, syn_min=None, train=None, note="ok"):
-    """Write a concise, execution-specific synthetic injection summary."""
     out = Path(out)
     seed = int(cfg["synthetic"]["seed"])
     n_per = int(cfg["synthetic"]["n_per_type"])
     min_n = int(cfg["prep"]["min_n"])
     syn_min_n = 0 if syn_min is None else len(syn_min)
     train_n = 0 if train is None else len(train)
-    syn_sess_n = 0
-    real_sess_n = 0
-    if train is not None and not train.empty and "y_syn" in train.columns:
-        syn_sess_n = int(train["y_syn"].eq(1).sum())
-        real_sess_n = int(train["y_syn"].eq(0).sum())
+    syn_sess_n = int(train["y_syn"].eq(1).sum()) if train is not None and "y_syn" in train.columns else 0
+    real_sess_n = int(train["y_syn"].eq(0).sum()) if train is not None and "y_syn" in train.columns else 0
+    injected_n = int(syn_min["is_injected_minute"].sum()) if syn_min is not None and "is_injected_minute" in syn_min.columns else 0
 
     lines = [
-        "Synthetic injection 자동 요약",
-        "============================",
-        "목적: 실제 뷰봇 라벨이 없어서, 명시적 이상 시나리오를 주입해 supervised 보조 score 학습용 데이터를 만든다.",
-        "입력: minute_model.csv의 실제 eligible session과 session_summary_processed의 세션 요약 feature.",
-        f"base eligible session 수: {base_n}",
-        f"seed: {seed}, scenario별 최대 추출 session 수: {n_per}, 최소 minute 수: {min_n}",
-        "",
-        "주입 방식",
-        "---------",
-        "1. 각 시나리오별로 base session을 무작위 선택한다.",
-        "2. 선택 세션에서 연속 minute 구간 하나를 선택한다. 구간 길이는 목표 비율을 따르되 최소 3분을 보장한다.",
-        "3. 해당 구간의 viewer/chat/unique 관련 값을 시나리오별 배율 또는 0 처리로 수정한다.",
-        "4. 수정 뒤 chat_per_viewer, delta_viewer_1m, delta_chat_1m을 다시 계산한다.",
-        "5. synthetic minute를 다시 session feature로 요약하고 y_syn=1로 둔다.",
-        "6. 실제 session은 y_syn=0, synthetic session은 y_syn=1로 합쳐 syn_train.csv를 만든다.",
-        "",
-        "시나리오",
-        "--------",
-        "hi_view_low_chat: 목표 30~60% 구간, viewer 1.05~1.50배, chat 0.02~0.25배, unique 0.02~0.30배.",
-        "silent_run: 목표 15~35% 구간, chat_count/unique_chatters/avg_msg_len/repeat_msg_ratio/new_chatter_ratio를 0으로 설정.",
-        "view_spike_no_chat: 목표 5~15% 구간, viewer 2.0~4.0배, chat 0.3~1.0배, unique 0.3~1.0배.",
-        "공통: 목표 구간이 너무 짧으면 최소 3분으로 보정한다.",
-        "",
-        "생성 결과",
-        "---------",
+        "Synthetic Injection Summary",
+        "===========================",
+        "Purpose: artificial viewer-chat mismatch injection for sanity checks and legacy supervised auxiliary scores.",
+        "This is not ground-truth label. y_syn must not be documented as ground truth.",
+        f"base eligible sessions: {base_n}",
+        f"seed: {seed}, n_per_type: {n_per}, min_n: {min_n}",
         f"status: {note}",
-        f"syn_minute row 수: {syn_min_n}",
-        f"syn_minute scenario 분포: {_counts_text(syn_min, 'syn_type')}",
-        f"syn_train row 수: {train_n}",
-        f"syn_train 실제 session(y_syn=0): {real_sess_n}",
-        f"syn_train synthetic session(y_syn=1): {syn_sess_n}",
-        "저장 파일: out/syn_minute.csv, out/syn_train.csv, out/synthetic_injection.txt",
+        f"syn_minute rows: {syn_min_n}",
+        f"injected minute rows: {injected_n}",
+        f"syn_minute scenario distribution: {_counts_text(syn_min, 'syn_type')}",
+        f"syn_train rows: {train_n}",
+        f"syn_train real sessions(y_syn=0): {real_sess_n}",
+        f"syn_train synthetic sessions(y_syn=1): {syn_sess_n}",
+        "Saved files: out/syn_minute.csv, out/syn_train.csv, out/synthetic_intervals.csv, out/synthetic_injection.txt",
     ]
     (out / "synthetic_injection.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -126,14 +151,11 @@ def make_synthetic(minute_model, session_model, out, cfg):
     rng = np.random.default_rng(int(cfg["synthetic"]["seed"]))
 
     if minute_model.empty or session_model.empty:
-        write_injection_doc(out, cfg, base_n=0, note="minute_model 또는 session_model이 비어 있어 synthetic 생성 안 됨")
+        _save_intervals(pd.DataFrame(), out)
+        write_injection_doc(out, cfg, base_n=0, note="minute_model or session_model is empty; synthetic generation skipped")
         return pd.DataFrame()
 
-    # Synthetic anomalies are injected into all eligible real sessions.
-    # No detector-combined cutoff is used, because final score fusion is not part
-    # of this deliverable.
     base_sessions = session_model
-
     keys = base_sessions["session_key"].dropna().unique()
     n_per = min(int(cfg["synthetic"]["n_per_type"]), len(keys))
     kinds = ["hi_view_low_chat", "silent_run", "view_spike_no_chat"]
@@ -148,11 +170,13 @@ def make_synthetic(minute_model, session_model, out, cfg):
                 idx += 1
 
     if not rows:
-        write_injection_doc(out, cfg, base_n=len(base_sessions), note="min_n 조건을 만족하는 base session이 없어 synthetic 생성 안 됨")
+        _save_intervals(pd.DataFrame(), out)
+        write_injection_doc(out, cfg, base_n=len(base_sessions), note="no base sessions satisfy min_n; synthetic generation skipped")
         return pd.DataFrame()
 
     syn_min = pd.concat(rows, ignore_index=True)
     syn_min.to_csv(out / "syn_minute.csv", index=False, encoding="utf-8-sig")
+    _save_intervals(syn_min, out)
 
     _, syn_sess, _ = make_session(syn_min, syn_min, cfg)
     syn_sess["y_syn"] = 1

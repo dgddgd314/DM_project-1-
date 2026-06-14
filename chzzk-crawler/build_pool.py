@@ -1,6 +1,6 @@
 """
 Build a pool of ~100 top GAME streamers from CHZZK,
-then randomly select 20 for each crawling session.
+then randomly select 30 for each crawling session.
 """
 import requests
 import json
@@ -15,9 +15,9 @@ from configs.settings import get_settings
 settings = get_settings()
 
 POOL_SIZE = 100   # How many streamers to collect into the pool
-SELECT_N = 15     # How many to randomly pick per session
+SELECT_N = 30     # How many to randomly pick per session
 POOL_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pool_100.csv")
-SELECTED_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "top15_targets.csv")
+SELECTED_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "top30_targets.csv")
 
 
 def fetch_top_game_streamers(target_pool_size: int = POOL_SIZE) -> list[dict]:
@@ -113,4 +113,4 @@ if __name__ == "__main__":
     save_pool_csv(pool)
     random_select_and_save(pool, SELECT_N)
     
-    print(f"\nNext step: run 'python scripts/setup.py --load-csv top15_targets.csv' to update DB targets.")
+    print(f"\nNext step: run 'python scripts/setup.py --load-csv top30_targets.csv' to update DB targets.")

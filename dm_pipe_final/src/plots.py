@@ -1,20 +1,20 @@
 from pathlib import Path
+import shutil
 import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
-from matplotlib.lines import Line2D
-from matplotlib.ticker import FormatStrFormatter
+
 
 warnings.filterwarnings("ignore")
 _available_fonts = {f.name for f in font_manager.fontManager.ttflist}
 plt.rcParams["font.family"] = "Malgun Gothic" if "Malgun Gothic" in _available_fonts else "DejaVu Sans"
 plt.rcParams["axes.unicode_minus"] = False
-plt.rcParams["axes.formatter.use_mathtext"] = False
 
 KEY = ["run_id", "broad_no"]
 DPI = 200
+SESSION_CLUSTER_TITLE_NOTE = "cluster_number는 행동 군집 번호이며 정답 라벨/확률 아님"
 
 
 def _save(fig, path):
@@ -25,18 +25,19 @@ def _save(fig, path):
 
 def _blank(path, msg):
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.text(0.5, 0.5, msg, ha="center", va="center", fontsize=13)
+    ax.text(0.5, 0.5, msg, ha="center", va="center", fontsize=12)
     ax.axis("off")
     _save(fig, path)
 
 
-def _table(df, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    out = df.copy()
-    for c in out.columns:
-        if pd.api.types.is_float_dtype(out[c]):
-            out[c] = out[c].round(3)
-    out.to_csv(path, index=False, encoding="utf-8-sig")
+def _read(out, name):
+    path = Path(out) / name
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
 
 
 def _plot_df(minute):
@@ -45,469 +46,706 @@ def _plot_df(minute):
         return p
     p["minute_ts"] = pd.to_datetime(p["minute_ts"], errors="coerce")
     p = p.sort_values(KEY + ["minute_ts"]).reset_index(drop=True)
+    for col in ["viewer_count_last", "chat_count", "unique_chatters"]:
+        if col not in p.columns:
+            p[col] = 0
+        p[col] = pd.to_numeric(p[col], errors="coerce").fillna(0)
     p["viewer_log"] = np.log1p(p["viewer_count_last"].clip(lower=0))
     p["chat_log"] = np.log1p(p["chat_count"].clip(lower=0))
     p["unique_log"] = np.log1p(p["unique_chatters"].clip(lower=0))
     p["gap"] = p["viewer_log"] - p["chat_log"]
     p["zero_chat"] = p["chat_count"].eq(0)
-    p["minute_idx"] = p.groupby(KEY).cumcount() + 1
-    p["session_id"] = p["run_id"].astype(str) + "_" + p["broad_no"].astype(str)
-    if "delta_viewer_1m" not in p.columns:
-        p["delta_viewer_1m"] = p.groupby(KEY)["viewer_count_last"].diff()
-    if "delta_chat_1m" not in p.columns:
-        p["delta_chat_1m"] = p.groupby(KEY)["chat_count"].diff()
-    p["unique_delta_1m"] = p.groupby(KEY)["unique_chatters"].diff()
-    block = p.groupby(KEY)["zero_chat"].transform(lambda x: x.ne(x.shift()).cumsum())
-    p["zrun"] = p["zero_chat"].groupby([p["run_id"], p["broad_no"], block]).cumcount().add(1).where(p["zero_chat"], 0).astype(int)
+    if "minute_idx" not in p.columns:
+        p["minute_idx"] = p.groupby(KEY).cumcount() + 1
     return p
 
 
-def _std_sess(s):
-    d = s.copy()
-    rename = {
-        "viewer_med": "median_viewer",
-        "chat_mean": "mean_chat",
-        "unique_mean": "mean_unique",
-        "zero_rate": "zero_chat_rate",
-        "gap_med": "median_gap",
-        "gap_max": "max_gap",
-        "zrun_max": "max_zero_run",
-        "cluster_number": "kmeans",
-    }
-    for a, b in rename.items():
-        if a in d.columns and b not in d.columns:
-            d[b] = d[a]
-    return d
-
-
-def _size_gap(d):
-    if "max_gap" in d.columns:
-        return (d["max_gap"].fillna(0).clip(lower=0) * 30).clip(lower=22, upper=280)
-    return pd.Series(45, index=d.index)
-
-
-def _size_zrun(d):
-    if "max_zero_run" in d.columns:
-        return (45 + 25 * np.log1p(d["max_zero_run"].fillna(0).clip(lower=0))).clip(35, 180)
-    return pd.Series(45, index=d.index)
-
-
-def _label_top(ax, d, score=None, n=5):
-    if d.empty:
-        return
-    if score and score in d.columns:
-        d = d.sort_values(score, ascending=False).head(n)
-    else:
-        d = d.sort_values(["zero_chat_rate", "median_gap"], ascending=False).head(n)
-    for _, r in d.iterrows():
-        ax.annotate(
-            f"r{int(r['run_id'])}\nb{str(r['broad_no'])[-4:]}",
-            (r["median_viewer"], r["median_gap"]),
-            xytext=(5, 5), textcoords="offset points",
-            fontsize=8, weight="bold", color="black", alpha=0.85,
-        )
-
-
-def _add_size_legend(ax):
-    vals = [4, 6, 8]
-    handles = [plt.scatter([], [], s=v * 30, c="gray", edgecolors="black", alpha=.7) for v in vals]
-    ax.legend(handles, [str(v) for v in vals], title="max_gap(size)", loc="lower right", frameon=True)
-
-
-def _base_map(ax, d, title, flag=None, score=None, label="flag"):
-    d = _std_sess(d).dropna(subset=["median_viewer", "median_gap"]).copy()
-    if d.empty:
-        ax.text(.5, .5, "no session", ha="center", va="center")
-        ax.axis("off")
-        return None
-
-    if flag is None:
-        flag = pd.Series(False, index=d.index)
-    flag = flag.reindex(d.index).fillna(False)
-    bg = d.loc[~flag]
-    fg = d.loc[flag]
-
-    sc = ax.scatter(
-        bg["median_viewer"], bg["median_gap"],
-        s=_size_gap(bg), c=bg["zero_chat_rate"], cmap="viridis", vmin=0, vmax=1,
-        alpha=0.25, edgecolor="none",
-    )
-    ax.scatter(
-        fg["median_viewer"], fg["median_gap"],
-        s=_size_gap(fg), c=fg["zero_chat_rate"], cmap="viridis", vmin=0, vmax=1,
-        alpha=0.9, edgecolor="red", linewidth=1.1, label=label,
-    )
-    if len(fg):
-        _label_top(ax, fg, score)
-        ax.legend(loc="upper right", frameon=True)
-    ax.set_title(title)
-    ax.set_xscale("log")
-    ax.set_xlabel("median_viewer (log scale)")
-    ax.set_ylabel("median_gap")
-    ax.grid(True, alpha=0.2)
-    return sc
-
-
-def _flag_by_label_or_rank(d, score, lab=None, top=.05):
-    if lab and lab in d.columns and d[lab].notna().any():
-        return d[lab].eq(-1)
-    if score in d.columns and d[score].notna().any():
-        return d[score].ge(d[score].quantile(1 - top))
-    return pd.Series(False, index=d.index)
-
-
-def _cluster_map(ax, d, col, title):
-    d = _std_sess(d).dropna(subset=["median_viewer", "median_gap"]).copy()
-    if d.empty or col not in d.columns or d[col].isna().all():
-        ax.text(.5, .5, f"{title}\nnot available", ha="center", va="center")
-        ax.axis("off")
-        return
-    vals = sorted(d[col].dropna().unique(), key=lambda x: float(x))
-    cmap = plt.get_cmap("tab10")
-    color_map = {v: cmap(i % 10) for i, v in enumerate(vals)}
-    for v in vals:
-        part = d[d[col].eq(v)]
-        lab = "-1 noise" if str(v) == "-1" else str(int(v)) if float(v).is_integer() else str(v)
-        ax.scatter(
-            part["median_viewer"], part["median_gap"],
-            s=_size_zrun(part), c=[color_map[v]], alpha=0.75,
-            edgecolor="white", linewidth=0.5, label=lab,
-        )
-    ax.set_xscale("log")
-    ax.set_title(title)
-    ax.set_xlabel("median_viewer (log scale)")
-    ax.set_ylabel("median_gap")
-    ax.grid(True, alpha=0.2)
-    ax.legend(loc="upper left", title=col, frameon=True, fontsize=8)
-
-
-def _quality_tables(session_all, session_model, tables):
-    all_zero = int(session_all.get("all_zero", pd.Series(False, index=session_all.index)).sum())
-    tables["quality_table.csv"] = pd.DataFrame([
-        {"item": "all_sessions", "value": len(session_all), "note": "including all-zero chat"},
-        {"item": "all_zero_sessions", "value": all_zero, "note": "saved as QC bucket"},
-        {"item": "behavior_sessions", "value": int((~session_all.get("all_zero", pd.Series(False, index=session_all.index))).sum()), "note": "all-zero excluded"},
-        {"item": "model_sessions", "value": len(session_model), "note": "eligible for clustering/modeling"},
-    ])
-    if len(session_model):
-        tables["metric_table.csv"] = pd.DataFrame([
-            {"metric": "median_viewer", "median": session_model["viewer_med"].median(), "q1": session_model["viewer_med"].quantile(.25), "q3": session_model["viewer_med"].quantile(.75)},
-            {"metric": "mean_chat_per_min", "median": session_model["chat_mean"].median(), "q1": session_model["chat_mean"].quantile(.25), "q3": session_model["chat_mean"].quantile(.75)},
-            {"metric": "median_gap", "median": session_model["gap_med"].median(), "q1": session_model["gap_med"].quantile(.25), "q3": session_model["gap_med"].quantile(.75)},
-            {"metric": "zero_chat_rate", "median": session_model["zero_rate"].median(), "q1": session_model["zero_rate"].quantile(.25), "q3": session_model["zero_rate"].quantile(.75)},
-        ])
-
-
-def _plot_quality(p, session_all, session_model, plots):
+def _plot_quality(minute_all, session_all, session_model, plots):
+    p = _plot_df(minute_all)
     if p.empty:
         _blank(plots / "01_data_quality.png", "no minute data")
         return
     fig, ax = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
     ax = ax.ravel()
-
-    all_zero = int(session_all.get("all_zero", pd.Series(False, index=session_all.index)).sum())
+    all_zero = int(session_all.get("all_zero", pd.Series(False, index=session_all.index)).sum()) if session_all is not None and not session_all.empty else 0
     counts = [len(session_all), all_zero, len(session_model)]
-    names = ["all\nsessions", "all-zero\nsessions", "modeling\nsessions"]
-    ax[0].bar(names, counts, edgecolor="black")
-    for i, v in enumerate(counts):
-        ax[0].text(i, v, str(v), ha="center", va="bottom")
+    ax[0].bar(["all sessions", "all-zero", "handoff sessions"], counts, edgecolor="black")
     ax[0].set_title("Session filtering")
     ax[0].set_ylabel("count")
-    ax[0].grid(axis="y", alpha=.25)
-
-    nonzero = p.groupby(KEY)["chat_count"].apply(lambda x: x.ne(0).mean() * 100)
-    ax[1].hist(nonzero, bins=15, edgecolor="black")
-    ax[1].set_title("Session non-zero chat ratio")
-    ax[1].set_xlabel("non-zero chat ratio (%)")
-    ax[1].set_ylabel("sessions")
-    ax[1].grid(axis="y", alpha=.25)
-
-    z = p.loc[p["zero_chat"], "zrun"].value_counts().sort_index().head(25)
-    ax[2].bar(z.index.astype(str), z.values)
-    ax[2].set_title("Consecutive zero-chat run")
-    ax[2].set_xlabel("zero-run length")
-    ax[2].set_ylabel("count (log scale)")
-    ax[2].set_yscale("log")
-    ax[2].tick_params(axis="x", rotation=45)
-    ax[2].grid(axis="y", alpha=.25)
-
-    tmp = p.dropna(subset=["viewer_count_last"]).copy()
-    if len(tmp) >= 10:
-        tmp["viewer_bin"] = pd.qcut(tmp["viewer_count_last"].rank(method="first"), 10, labels=False, duplicates="drop")
-        by_bin = tmp.groupby("viewer_bin")["zero_chat"].mean()
-        ax[3].bar(by_bin.index.astype(str), by_bin.values)
-    ax[3].set_title("Zero-chat rate by viewer decile")
-    ax[3].set_xlabel("viewer decile")
-    ax[3].set_ylabel("zero-chat rate")
-    ax[3].set_ylim(0, 1)
-    ax[3].grid(axis="y", alpha=.25)
-    fig.suptitle("Data quality and zero-chat diagnostics", fontsize=15)
+    ax[0].grid(axis="y", alpha=0.25)
+    ax[1].hist(p["viewer_count_last"].dropna(), bins="sturges", edgecolor="black")
+    ax[1].set_title("Viewer count distribution")
+    ax[1].set_xlabel("viewer_count_last")
+    ax[1].set_ylabel("minutes")
+    ax[1].grid(axis="y", alpha=0.25)
+    z = p.loc[p["zero_chat"]].groupby(KEY).size()
+    ax[2].hist(z, bins="sturges", edgecolor="black")
+    ax[2].set_title("Zero-chat minute count per session")
+    ax[2].set_xlabel("zero-chat minutes")
+    ax[2].set_ylabel("sessions")
+    ax[2].grid(axis="y", alpha=0.25)
+    if "off_window_policy" in p.columns:
+        vc = p["off_window_policy"].value_counts()
+        ax[3].bar(vc.index.astype(str), vc.values, edgecolor="black")
+    else:
+        ax[3].hist(p["gap"].dropna(), bins="sturges", edgecolor="black")
+    ax[3].set_title("Viewer-chat gap distribution")
+    ax[3].set_xlabel("log viewer - log chat")
+    ax[3].grid(axis="y", alpha=0.25)
+    fig.suptitle("01 Data quality - not ground-truth label", fontsize=14)
     _save(fig, plots / "01_data_quality.png")
 
 
-def _plot_dist_time(p, plots):
+def _plot_dist_time(minute_model, plots):
+    p = _plot_df(minute_model)
     if p.empty:
         _blank(plots / "02_dist_time.png", "no minute data")
         return
     agg = p.groupby("minute_idx").agg(
-        viewer_med=("viewer_count_last", "median"), viewer_q1=("viewer_count_last", lambda x: x.quantile(.25)), viewer_q3=("viewer_count_last", lambda x: x.quantile(.75)),
-        gap_med=("gap", "median"), gap_q1=("gap", lambda x: x.quantile(.25)), gap_q3=("gap", lambda x: x.quantile(.75)),
-        n=("session_id", "nunique"),
+        viewer_med=("viewer_count_last", "median"),
+        chat_med=("chat_count", "median"),
+        gap_med=("gap", "median"),
+        n_session=("session_key", "nunique"),
     ).reset_index()
-
     fig, ax = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
     ax[0, 0].hist(p["gap"].dropna(), bins="sturges", edgecolor="black")
-    ax[0, 0].set_title("viewer-chat log gap distribution")
-    ax[0, 0].set_xlabel("log1p(viewer) - log1p(chat)")
-    ax[0, 0].set_ylabel("count")
-    ax[0, 0].grid(axis="y", alpha=.25)
-
+    ax[0, 0].set_title("Viewer-chat log gap")
     ax[0, 1].hist(p["chat_log"].dropna(), bins="sturges", edgecolor="black")
-    ax[0, 1].set_title("chat_count log distribution")
-    ax[0, 1].set_xlabel("log1p(chat_count)")
-    ax[0, 1].set_ylabel("count")
-    ax[0, 1].grid(axis="y", alpha=.25)
-
-    ax[1, 0].fill_between(agg["minute_idx"], agg["viewer_q1"], agg["viewer_q3"], color="tab:blue", alpha=.2, label="IQR")
-    ax[1, 0].plot(agg["minute_idx"], agg["viewer_med"], color="tab:blue", lw=2, label="median")
-    ax[1, 0].set_title("Session trajectory: viewer")
+    ax[0, 1].set_title("Chat log distribution")
+    ax[1, 0].plot(agg["minute_idx"], agg["viewer_med"], color="tab:blue", label="viewer median")
+    ax[1, 0].plot(agg["minute_idx"], agg["chat_med"], color="tab:orange", label="chat median")
+    ax[1, 0].set_title("Minute trajectory")
     ax[1, 0].set_xlabel("minute_idx")
-    ax[1, 0].set_ylabel("viewer_count_last")
-    ax[1, 0].grid(alpha=.2)
-    ax[1, 0].legend(loc="upper left")
-
-    ax[1, 1].fill_between(agg["minute_idx"], agg["gap_q1"], agg["gap_q3"], color="tab:blue", alpha=.2, label="IQR")
-    ax[1, 1].plot(agg["minute_idx"], agg["gap_med"], color="tab:blue", lw=2, label="median")
-    ax[1, 1].bar(agg["minute_idx"], agg["n"] / max(agg["n"].max(), 1), color="gray", alpha=.22, label="surviving N scaled")
-    ax[1, 1].set_title("Session trajectory: viewer-chat gap")
+    ax[1, 0].legend()
+    ax[1, 1].plot(agg["minute_idx"], agg["gap_med"], color="tab:green")
+    ax[1, 1].bar(agg["minute_idx"], agg["n_session"] / max(agg["n_session"].max(), 1), alpha=0.2, color="gray")
+    ax[1, 1].set_title("Median gap and surviving sessions")
     ax[1, 1].set_xlabel("minute_idx")
-    ax[1, 1].set_ylabel("gap")
-    ax[1, 1].grid(alpha=.2)
-    ax[1, 1].legend(loc="upper left")
-    fig.suptitle("Distribution and time structure", fontsize=15)
+    for a in ax.ravel():
+        a.grid(alpha=0.25)
+    fig.suptitle("02 Distribution and time structure - not ground-truth label", fontsize=14)
     _save(fig, plots / "02_dist_time.png")
 
 
-def _plot_view_chat(p, plots, tables):
+def _plot_view_chat(minute_model, plots):
+    p = _plot_df(minute_model)
     if p.empty:
         _blank(plots / "03_view_chat.png", "no minute data")
         return
-    fig, ax = plt.subplots(1, 3, figsize=(17, 5), constrained_layout=True)
-
-    hb = ax[0].hexbin(p["chat_log"], p["viewer_log"], gridsize=50, cmap="Blues", mincnt=1, bins="log")
-    fig.colorbar(hb, ax=ax[0], label="log(count)")
+    fig, ax = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True)
+    hb = ax[0].hexbin(p["chat_log"], p["viewer_log"], gridsize=45, cmap="Blues", mincnt=1, bins="log")
+    fig.colorbar(hb, ax=ax[0], label="log count")
     ax[0].set_title("viewer_log vs chat_log")
     ax[0].set_xlabel("chat_log")
     ax[0].set_ylabel("viewer_log")
-
-    m = p[["delta_viewer_1m", "delta_chat_1m"]].dropna()
-    if len(m):
-        qv = m["delta_viewer_1m"].quantile([.01, .99])
-        qc = m["delta_chat_1m"].quantile([.01, .99])
-        ax[1].scatter(m["delta_viewer_1m"], m["delta_chat_1m"], s=1, alpha=.05)
-        ax[1].set_xlim(qv.iloc[0], qv.iloc[1])
-        ax[1].set_ylim(qc.iloc[0], qc.iloc[1])
-    ax[1].axhline(0, ls="--", color="red", alpha=.5)
-    ax[1].axvline(0, ls="--", color="red", alpha=.5)
+    ax[1].scatter(p.get("delta_viewer_1m", pd.Series(dtype=float)), p.get("delta_chat_1m", pd.Series(dtype=float)), s=3, alpha=0.08)
+    dx = pd.to_numeric(p.get("delta_viewer_1m", pd.Series(dtype=float)), errors="coerce").dropna()
+    dy = pd.to_numeric(p.get("delta_chat_1m", pd.Series(dtype=float)), errors="coerce").dropna()
+    if len(dx) > 10:
+        ax[1].set_xlim(dx.quantile(0.01), dx.quantile(0.99))
+    if len(dy) > 10:
+        ax[1].set_ylim(dy.quantile(0.01), dy.quantile(0.99))
+    ax[1].axhline(0, color="red", ls="--", lw=1)
+    ax[1].axvline(0, color="red", ls="--", lw=1)
     ax[1].set_title("1-minute viewer vs chat change")
     ax[1].set_xlabel("delta_viewer_1m")
     ax[1].set_ylabel("delta_chat_1m")
-    ax[1].grid(alpha=.2)
-
-    base = p.sort_values(KEY + ["minute_ts"])
-    rows = []
-    for lag in range(11):
-        tmp = base.copy()
-        tmp["chat_next"] = tmp.groupby(KEY)["delta_chat_1m"].shift(-lag)
-        tmp["unique_next"] = tmp.groupby(KEY)["unique_delta_1m"].shift(-lag)
-        vc = tmp[["delta_viewer_1m", "chat_next"]].dropna()
-        vu = tmp[["delta_viewer_1m", "unique_next"]].dropna()
-        rows.append({
-            "lag_min": lag,
-            "chat_spearman": vc["delta_viewer_1m"].corr(vc["chat_next"], method="spearman") if len(vc) else np.nan,
-            "unique_spearman": vu["delta_viewer_1m"].corr(vu["unique_next"], method="spearman") if len(vu) else np.nan,
-        })
-    lag = pd.DataFrame(rows)
-    tables["lag_corr.csv"] = lag
-    ax[2].plot(lag["lag_min"], lag["chat_spearman"], marker="o", label="viewer delta -> chat delta")
-    ax[2].plot(lag["lag_min"], lag["unique_spearman"], marker="o", label="viewer delta -> unique delta")
-    ax[2].axhline(0, ls="--", lw=1)
-    ax[2].set_title("Lag response after viewer change")
-    ax[2].set_xlabel("lag (minutes)")
-    ax[2].set_ylabel("Spearman correlation")
-    ax[2].grid(alpha=.3)
-    ax[2].legend()
-    fig.suptitle("Viewer-chat dynamics", fontsize=15)
+    zero_by_bin = pd.DataFrame()
+    if p["viewer_count_last"].nunique() > 1:
+        p["_viewer_bin"] = pd.qcut(p["viewer_count_last"].rank(method="first"), 10, labels=False, duplicates="drop")
+        zero_by_bin = p.groupby("_viewer_bin")["zero_chat"].mean()
+    if not zero_by_bin.empty:
+        ax[2].bar(zero_by_bin.index.astype(str), zero_by_bin.values, edgecolor="black")
+    ax[2].set_title("Zero-chat rate by viewer decile")
+    ax[2].set_xlabel("viewer decile")
+    ax[2].set_ylabel("zero-chat rate")
+    ax[2].set_ylim(0, 1)
+    for a in ax:
+        a.grid(alpha=0.25)
+    fig.suptitle("03 Viewer-chat dynamics - not ground-truth label", fontsize=14)
     _save(fig, plots / "03_view_chat.png")
 
-    pairs = [
-        ("viewer_log", "chat_log"),
-        ("viewer_log", "unique_log"),
-        ("delta_viewer_1m", "delta_chat_1m"),
-        ("chat_log", "gap"),
-    ]
-    tables["corr_table.csv"] = pd.DataFrame([
-        {"pair": f"{a} vs {b}", "pearson": p[a].corr(p[b], method="pearson"), "spearman": p[a].corr(p[b], method="spearman")}
-        for a, b in pairs if a in p.columns and b in p.columns
-    ])
 
-
-def _plot_cluster(s, out, plots, tables):
-    d = _std_sess(s)
-    if d.empty:
-        _blank(plots / "04_cluster.png", "no session data")
+def _plot_session_cluster(session_model, plots):
+    s = session_model.copy()
+    if s.empty or "cluster_number" not in s.columns:
+        _blank(plots / "04_cluster_session.png", f"session cluster handoff not available\n{SESSION_CLUSTER_TITLE_NOTE}")
         return
-    fig, ax = plt.subplots(2, 3, figsize=(17, 10), constrained_layout=True)
+    s["viewer_med"] = pd.to_numeric(s.get("viewer_med"), errors="coerce")
+    s["gap_med"] = pd.to_numeric(s.get("gap_med"), errors="coerce")
+    s["cluster_number"] = pd.to_numeric(s.get("cluster_number"), errors="coerce")
+    s = s.dropna(subset=["viewer_med", "gap_med", "cluster_number"])
+    if s.empty:
+        _blank(plots / "04_cluster_session.png", f"session cluster handoff not available\n{SESSION_CLUSTER_TITLE_NOTE}")
+        return
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
+    palette = plt.get_cmap("tab10").colors
+    cluster_order = sorted(s["cluster_number"].dropna().unique())
+    cluster_colors = {}
+    for i, cluster_id in enumerate(cluster_order):
+        part = s.loc[s["cluster_number"].eq(cluster_id)]
+        color = palette[i % len(palette)]
+        cluster_colors[cluster_id] = color
+        label_id = int(cluster_id) if float(cluster_id).is_integer() else cluster_id
+        ax[0].scatter(
+            part["viewer_med"],
+            part["gap_med"],
+            label=f"cluster {label_id} (n={len(part)})",
+            color=color,
+            s=45,
+            alpha=0.75,
+            edgecolor="white",
+            linewidth=0.4,
+        )
+    ax[0].set_xscale("log")
+    ax[0].set_title("세션 단위 행동 군집 산점도")
+    ax[0].set_xlabel("세션 중앙 시청자 수")
+    ax[0].set_ylabel("viewer-chat gap 중앙값")
+    ax[0].legend(title="cluster_number", fontsize=8)
+    ax[0].text(
+        0.02,
+        0.02,
+        "2D는 해석용 projection이며 clustering은 전체 feature로 수행됨",
+        transform=ax[0].transAxes,
+        fontsize=8,
+        ha="left",
+        va="bottom",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.72),
+    )
+    prof = s.groupby("cluster_number").agg(n=("session_key", "size"), viewer_med=("viewer_med", "median"), chat_mean=("chat_mean", "mean"), zero_rate=("zero_rate", "mean")).reset_index()
+    prof = prof.sort_values("cluster_number")
+    bar_colors = [cluster_colors.get(v, "tab:blue") for v in prof["cluster_number"]]
+    bars = ax[1].bar(prof["cluster_number"].astype(int).astype(str), prof["n"], edgecolor="black", color=bar_colors)
+    for bar in bars:
+        ax[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{int(bar.get_height())}", ha="center", va="bottom", fontsize=9)
+    ax[1].set_title("군집별 세션 수")
+    ax[1].set_xlabel("cluster_number")
+    ax[1].set_ylabel("세션 수")
+    for a in ax:
+        a.grid(alpha=0.25)
+    fig.suptitle(f"04 세션 단위 행동 군집 산점도 - {SESSION_CLUSTER_TITLE_NOTE}", fontsize=14)
+    _save(fig, plots / "04_cluster_session.png")
 
-    sel = pd.read_csv(Path(out) / "cluster_select.csv") if Path(out, "cluster_select.csv").exists() else pd.DataFrame()
-    if not sel.empty:
-        ax[0, 0].plot(sel["k"], sel["silhouette"], marker="o")
-    ax[0, 0].set_title("KMeans selection")
-    ax[0, 0].set_xlabel("K")
-    ax[0, 0].set_ylabel("silhouette")
-    ax[0, 0].grid(alpha=.25)
 
-    _cluster_map(ax[0, 1], d, "kmeans", "KMeans session type map")
+def _plot_session_k_selection(out, plots):
+    sel = _read(out, "cluster_select.csv")
+    if sel.empty or "k" not in sel.columns:
+        _blank(plots / "05_session_k_selection.png", f"session K selection not available\n{SESSION_CLUSTER_TITLE_NOTE}")
+        return
+    work = sel.copy()
+    work["k"] = pd.to_numeric(work["k"], errors="coerce")
+    work["selection_score"] = pd.to_numeric(work.get("selection_score"), errors="coerce")
+    work["silhouette"] = pd.to_numeric(work.get("silhouette"), errors="coerce")
+    work["davies_bouldin"] = pd.to_numeric(work.get("davies_bouldin"), errors="coerce")
+    work["calinski_harabasz"] = pd.to_numeric(work.get("calinski_harabasz"), errors="coerce")
+    work = work.dropna(subset=["k"]).sort_values("k")
+    if work.empty:
+        _blank(plots / "05_session_k_selection.png", f"session K selection not available\n{SESSION_CLUSTER_TITLE_NOTE}")
+        return
+    if "selected" in work.columns:
+        selected = work["selected"].astype(str).str.lower().isin(["true", "1", "yes"])
+    else:
+        selected = work["silhouette"].eq(work["silhouette"].max())
+    colors = np.where(selected, "tab:orange", "tab:blue")
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+    bars = ax[0].bar(work["k"].astype(int).astype(str), work["selection_score"], color=colors, edgecolor="black", alpha=0.85)
+    for bar, val in zip(bars, work["selection_score"]):
+        if pd.notna(val):
+            ax[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{float(val):.3f}", ha="center", va="bottom", fontsize=8)
+    ax[0].set_title("selection_score by K")
+    ax[0].set_xlabel("K")
+    ax[0].set_ylabel("selection_score")
+    ax[1].plot(work["k"], work["silhouette"], marker="o", color="tab:blue", label="silhouette")
+    ax[1].plot(work["k"], work["davies_bouldin"], marker="s", color="tab:red", label="Davies-Bouldin (lower is better)")
+    if work["calinski_harabasz"].notna().any():
+        ch = work["calinski_harabasz"]
+        denom = ch.max() - ch.min()
+        ch_scaled = pd.Series(0.5, index=work.index) if denom == 0 else (ch - ch.min()) / denom
+        ax[1].plot(work["k"], ch_scaled, marker="^", color="tab:green", label="Calinski-Harabasz scaled")
+    ax[1].set_title("diagnostic metrics by K")
+    ax[1].set_xlabel("K")
+    ax[1].set_ylabel("diagnostic value")
+    ax[1].legend(fontsize=8)
+    ax[1].text(
+        0.02,
+        0.02,
+        "selection_score = direction-corrected percentile-rank composite of silhouette, Calinski-Harabasz, Davies-Bouldin, size balance, and profile separation.\nInertia is diagnostic only, not a selection criterion.",
+        transform=ax[1].transAxes,
+        fontsize=8,
+        ha="left",
+        va="bottom",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.75),
+    )
+    for a in ax:
+        a.grid(alpha=0.25)
+    fig.suptitle("05 Session K selection: composite score, not ground-truth label", fontsize=14)
+    _save(fig, plots / "05_session_k_selection.png")
 
-    prof = d.groupby("kmeans").agg(n=("session_key", "size"), viewer=("median_viewer", "median"), chat=("mean_chat", "mean"), zero=("zero_chat_rate", "mean"), gap=("median_gap", "median"), zrun=("max_zero_run", "median")).reset_index() if "kmeans" in d else pd.DataFrame()
-    if not prof.empty:
-        tables["cluster_profile.csv"] = prof
-        mat = prof.set_index("kmeans")[["n", "viewer", "chat", "zero", "gap", "zrun"]]
+
+def _plot_session_cluster_profile(out, plots):
+    prof = _read(out, "cluster_profile.csv")
+    if prof.empty or "cluster_number" not in prof.columns:
+        _blank(plots / "06_session_cluster_profile.png", f"session cluster profile not available\n{SESSION_CLUSTER_TITLE_NOTE}")
+        return
+    metrics = [c for c in ["viewer_med", "chat_mean", "unique_mean", "zero_rate", "gap_med", "zrun_max"] if c in prof.columns]
+    if not metrics:
+        _blank(plots / "06_session_cluster_profile.png", f"session cluster profile not available\n{SESSION_CLUSTER_TITLE_NOTE}")
+        return
+    work = prof.copy().sort_values("cluster_number")
+    matrix = work[metrics].apply(pd.to_numeric, errors="coerce")
+    scaled = matrix.copy()
+    for col in metrics:
+        lo = matrix[col].min()
+        hi = matrix[col].max()
+        scaled[col] = 0.5 if pd.isna(lo) or pd.isna(hi) or hi == lo else (matrix[col] - lo) / (hi - lo)
+    fig, ax = plt.subplots(figsize=(11, 5.8), constrained_layout=True)
+    im = ax.imshow(scaled.to_numpy(), aspect="auto", cmap="viridis", vmin=0, vmax=1)
+    ax.set_xticks(range(len(metrics)), metrics, rotation=30, ha="right")
+    ax.set_yticks(range(len(work)), work["cluster_number"].astype(str))
+    ax.set_xlabel("profile metric, min-max scaled for display")
+    ax.set_ylabel("cluster_number")
+    ax.set_title(f"06 session cluster profile - {SESSION_CLUSTER_TITLE_NOTE}")
+    for i in range(len(work)):
+        for j, col in enumerate(metrics):
+            val = matrix.iloc[i, j]
+            label = "" if pd.isna(val) else f"{val:.2g}"
+            ax.text(j, i, label, ha="center", va="center", color="white" if scaled.iloc[i, j] < 0.55 else "black", fontsize=8)
+    fig.colorbar(im, ax=ax, label="within-metric scaled profile value, not cluster id")
+    fig.text(0.5, 0.01, "cell text = original profile value; color = relative within-feature contrast", ha="center", fontsize=9)
+    _save(fig, plots / "06_session_cluster_profile.png")
+
+
+def _plot_session_cluster_stability(out, plots):
+    stab = _read(out, "mc_stab.csv")
+    if stab.empty or "ari_vs_base" not in stab.columns:
+        _blank(plots / "07_session_cluster_stability.png", "minute KMeans behavior-state stability diagnostic not available\nfilename retained for backward compatibility; not a supervised performance metric")
+        return
+    work = stab.copy()
+    work["seed"] = pd.to_numeric(work.get("seed"), errors="coerce")
+    work["ari_vs_base"] = pd.to_numeric(work.get("ari_vs_base"), errors="coerce")
+    work["mismatch_cluster_share"] = pd.to_numeric(work.get("mismatch_cluster_share"), errors="coerce")
+    work["selected_k"] = pd.to_numeric(work.get("selected_k"), errors="coerce")
+    work = work.sort_values("seed")
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
+    ax[0].plot(work["seed"], work["ari_vs_base"], marker="o", color="tab:blue")
+    ax[0].set_ylim(0, 1.02)
+    ax[0].set_xlabel("seed")
+    ax[0].set_ylabel("ARI vs base")
+    ax[0].set_title("seed/subsample ARI")
+    ax[1].plot(work["seed"], work["mismatch_cluster_share"], marker="o", color="tab:orange", label="mismatch share")
+    ax[1].set_xlabel("seed")
+    ax[1].set_ylabel("mismatch cluster share")
+    ax2 = ax[1].twinx()
+    ax2.step(work["seed"], work["selected_k"], where="mid", color="tab:green", alpha=0.65, label="selected_k")
+    ax2.set_ylabel("selected_k")
+    ax[1].set_title("selected_k / mismatch share")
+    for a in ax:
+        a.grid(alpha=0.25)
+    ari_min = work["ari_vs_base"].min()
+    ari_med = work["ari_vs_base"].median()
+    fig.suptitle(
+        f"07 minute KMeans behavior-state stability diagnostic: mc_stab.csv ARI/subsample, not supervised performance; filename retained for compatibility; ARI min={ari_min:.3f}, med={ari_med:.3f}",
+        fontsize=13,
+    )
+    _save(fig, plots / "07_session_cluster_stability.png")
+
+
+def _plot_ms(out, plots):
+    ms = _read(out, "m2_scores.csv")
+    if ms.empty or "minute_mismatch_score" not in ms.columns:
+        _blank(plots / "07_ms.png", "m2_scores.csv not available")
+        return
+    score = pd.to_numeric(ms["minute_mismatch_score"], errors="coerce").dropna()
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.hist(score, bins="sturges", edgecolor="black", color="tab:blue", alpha=0.75)
+    for q, color in [(0.90, "tab:orange"), (0.95, "tab:red"), (0.97, "tab:purple"), (0.99, "black")]:
+        cutoff = score.quantile(q)
+        ax.axvline(cutoff, color=color, ls="--", lw=1.5, label=f"q{int(q * 100)}={cutoff:.3f}")
+    ax.set_title("07 Method 2 minute_mismatch_score - not ground-truth label - grid only, no selected truth cutoff")
+    ax.set_xlabel("minute_mismatch_score")
+    ax.set_ylabel("minutes")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+    _save(fig, plots / "07_ms.png")
+
+
+def _plot_mc(out, plots):
+    prof = _read(out, "mc_profile.csv")
+    assign = _read(out, "mc_assign.csv")
+    if prof.empty:
+        _blank(plots / "08_mc.png", "mc_profile.csv not available")
+        return
+    fig, ax = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
+    if not assign.empty:
+        counts = assign["minute_cluster"].value_counts(dropna=False).sort_index()
+        ax[0, 0].bar(counts.index.astype(str), counts.values, edgecolor="black")
+    ax[0, 0].set_title("분 단위 군집 수")
+    ax[0, 0].set_xlabel("minute_cluster")
+    ax[0, 0].set_ylabel("분 row 수")
+    ax[0, 1].bar(prof["cluster_id"].astype(str), prof["share"], edgecolor="black", color="tab:green")
+    ax[0, 1].set_title("분 단위 군집 비중")
+    ax[0, 1].set_xlabel("minute_cluster")
+    cols = ["chat_deficit_med", "unique_deficit_med", "zero_chat_rate", "rolling_zero_rate_5m_p90", "cluster_mismatch_rank"]
+    mat = prof.set_index("cluster_id")[[c for c in cols if c in prof.columns]]
+    if not mat.empty:
         scaled = (mat - mat.min()) / (mat.max() - mat.min()).replace(0, 1)
-        im = ax[0, 2].imshow(scaled.values, cmap="viridis", aspect="auto", vmin=0, vmax=1)
-        ax[0, 2].set_xticks(range(len(mat.columns)), mat.columns, rotation=35, ha="right")
-        ax[0, 2].set_yticks(range(len(mat.index)), [str(int(x)) for x in mat.index])
+        im = ax[1, 0].imshow(scaled.values, aspect="auto", cmap="viridis", vmin=0, vmax=1)
+        ax[1, 0].set_xticks(range(len(mat.columns)), mat.columns, rotation=35, ha="right")
+        ax[1, 0].set_yticks(range(len(mat.index)), mat.index.astype(str))
         for i in range(mat.shape[0]):
             for j in range(mat.shape[1]):
-                ax[0, 2].text(j, i, f"{mat.iloc[i, j]:.2f}", ha="center", va="center", fontsize=7, color="white" if scaled.iloc[i, j] < .45 else "black")
-        ax[0, 2].set_title("KMeans profile")
-        fig.colorbar(im, ax=ax[0, 2], shrink=.8)
-    else:
-        ax[0, 2].axis("off")
-
-    gmm = pd.read_csv(Path(out) / "gmm_select.csv") if Path(out, "gmm_select.csv").exists() else pd.DataFrame()
-    if not gmm.empty:
-        x = "n_components" if "n_components" in gmm.columns else "n"
-        ax[1, 0].plot(gmm[x], gmm["bic"], marker="o", label="BIC")
-        if "aic" in gmm:
-            ax[1, 0].plot(gmm[x], gmm["aic"], marker="o", label="AIC")
-        ax[1, 0].legend()
-    ax[1, 0].set_title("GMM component selection")
-    ax[1, 0].set_xlabel("n_components")
-    ax[1, 0].set_ylabel("criterion (lower better)")
-    ax[1, 0].grid(alpha=.25)
-
-    _cluster_map(ax[1, 1], d, "gmm", "GMM robustness map")
-    _cluster_map(ax[1, 2], d, "hdbscan", "HDBSCAN density map")
-    fig.suptitle("Clustering summary: KMeans main, GMM/HDBSCAN checks", fontsize=15)
-    _save(fig, plots / "04_cluster.png")
+                ax[1, 0].text(j, i, f"{mat.iloc[i, j]:.2f}", ha="center", va="center", fontsize=7, color="white" if scaled.iloc[i, j] < 0.45 else "black")
+        fig.colorbar(im, ax=ax[1, 0], shrink=0.8, label="within-feature scaled profile value, not cluster id")
+    ax[1, 0].set_title("군집별 주요 신호 중앙값")
+    ax[1, 0].set_xlabel("cell text = original profile value; color = relative within-feature contrast")
+    interp = prof[["cluster_id", "interpretation"]].copy()
+    interp["interpretation"] = interp["interpretation"].replace({
+        "mismatch-like state": "viewer 대비 채팅 반응 약한 상태",
+        "active/high-chat state": "채팅 반응 활발 상태",
+        "low-scale quiet state": "소규모 조용한 상태",
+        "mixed state": "혼합 행동 상태",
+    })
+    ax[1, 1].axis("off")
+    ax[1, 1].table(cellText=interp.values, colLabels=["cluster_id", "해석"], loc="center", cellLoc="left")
+    ax[1, 1].set_title("분 단위 행동 상태이며 정답 라벨이 아님")
+    for a in ax.ravel()[:3]:
+        a.grid(alpha=0.25)
+    fig.suptitle("08 분 단위 행동 상태 군집 요약", fontsize=14)
+    _save(fig, plots / "08_mc.png")
+    shutil.copy2(plots / "08_mc.png", plots / "08_cluster_minute.png")
 
 
-def _plot_detectors(s, plots):
-    d = _std_sess(s)
-    if d.empty:
-        _blank(plots / "05_detectors.png", "no session data")
+def _heatmap(ax, df, value, title):
+    if df.empty or value not in df.columns:
+        ax.axis("off")
         return
-    specs = [
-        ("if_score", "if_lab", "IsolationForest"),
-        ("lof_score", "lof_lab", "LOF"),
-        ("ocsvm_score", "ocsvm_lab", "OneClassSVM"),
-    ]
-    fig, ax = plt.subplots(1, 3, figsize=(17, 5.4), constrained_layout=True)
-    sc = None
-    for a, (score, lab, title) in zip(ax, specs):
-        flag = _flag_by_label_or_rank(d, score, lab)
-        sc = _base_map(a, d, title, flag=flag, score=score, label=f"{title} flag")
-    if sc is not None:
-        fig.colorbar(sc, ax=ax, label="zero_chat_rate", shrink=.82)
-    fig.suptitle("Unsupervised detector review maps", fontsize=15)
-    _save(fig, plots / "05_detectors.png")
+    piv = df.pivot(index="min_duration", columns="threshold_q", values=value).sort_index()
+    im = ax.imshow(piv.values, aspect="auto", cmap="viridis")
+    ax.set_xticks(range(len(piv.columns)), [str(c) for c in piv.columns])
+    ax.set_yticks(range(len(piv.index)), [str(i) for i in piv.index])
+    ax.set_xlabel("threshold_q")
+    ax.set_ylabel("min_duration")
+    ax.set_title(title)
+    for i in range(piv.shape[0]):
+        for j in range(piv.shape[1]):
+            val = piv.iloc[i, j]
+            txt = f"{val:.2f}" if "rate" in value else f"{val:.0f}"
+            ax.text(j, i, txt, ha="center", va="center", fontsize=8, color="white" if val > np.nanmax(piv.values) / 2 else "black")
+    return im
 
 
-def _plot_models(s, plots):
-    d = _std_sess(s)
-    specs = [
-        ("ae_score", "AutoEncoder"),
-        ("svm_syn_score", "Synthetic SVM"),
-        ("xgb_syn_score", "Synthetic XGBoost"),
-        ("lgb_syn_score", "Synthetic LightGBM"),
-    ]
-    specs = [(c, t) for c, t in specs if c in d.columns and d[c].notna().sum() > 0]
-    if not specs:
-        _blank(plots / "06_models.png", "no model score available")
+def _plot_sens(out, plots):
+    sens = _read(out, "m2_sens.csv")
+    if sens.empty:
+        _blank(plots / "10_sens.png", "m2_sens.csv not available")
         return
-    n = len(specs)
-    rows, cols = (2, 2) if n > 2 else (1, n)
-    fig, ax = plt.subplots(rows, cols, figsize=(14 if cols == 2 else 8 * cols, 9 if rows == 2 else 5.2), constrained_layout=True)
-    axes = np.array(ax).reshape(-1)
-    sc = None
-    for a, (score, title) in zip(axes, specs):
-        flag = _flag_by_label_or_rank(d, score, None)
-        sc = _base_map(a, d, title, flag=flag, score=score, label=f"{title} top")
-    for a in axes[len(specs):]:
-        a.axis("off")
-    if sc is not None:
-        fig.colorbar(sc, ax=axes[:len(specs)], label="zero_chat_rate", shrink=.82)
-    fig.suptitle("Model-based score review maps", fontsize=15)
-    _save(fig, plots / "06_models.png")
-
-    if "pu_score" in d.columns and d["pu_score"].notna().sum() > 0:
-        fig, ax = plt.subplots(figsize=(8, 5.5))
-        flag = _flag_by_label_or_rank(d, "pu_score", None)
-        sc = _base_map(ax, d, "PU score", flag=flag, score="pu_score", label="PU top")
-        if sc is not None:
-            fig.colorbar(sc, ax=ax, label="zero_chat_rate")
-        _save(fig, plots / "07_pu.png")
+    sources = sens["score_source"].dropna().unique().tolist()[:4]
+    n = max(1, len(sources))
+    fig, ax = plt.subplots(n, 2, figsize=(13, 4.2 * n), constrained_layout=True)
+    ax = np.array(ax).reshape(n, 2)
+    for i, source in enumerate(sources):
+        part = sens[sens["score_source"].eq(source)]
+        im1 = _heatmap(ax[i, 0], part, "candidate_session_rate", f"{source}: candidate_session_rate")
+        im2 = _heatmap(ax[i, 1], part, "episode_count", f"{source}: episode_count")
+        if im1 is not None:
+            fig.colorbar(im1, ax=ax[i, 0], shrink=0.8)
+        if im2 is not None:
+            fig.colorbar(im2, ax=ax[i, 1], shrink=0.8)
+    fig.suptitle("10 Method 2 legacy sensitivity - not final selection - not ground-truth label", fontsize=14)
+    _save(fig, plots / "10_sens.png")
 
 
-def _write_tables(tables, out):
-    table_dir = Path(out) / "tables"
-    table_dir.mkdir(parents=True, exist_ok=True)
-    for name, df in tables.items():
-        _table(df, table_dir / name)
-    if tables:
-        with pd.ExcelWriter(table_dir / "eda_tables.xlsx", engine="openpyxl") as writer:
-            for name, df in tables.items():
-                df.to_excel(writer, sheet_name=Path(name).stem[:31], index=False)
+def _plot_ep(out, plots):
+    ms = _read(out, "m2_scores.csv")
+    ep = _read(out, "m2_ep.csv")
+    if ms.empty or ep.empty:
+        _blank(plots / "11_ep.png", "m2 episode inputs not available")
+        return
+    ep = ep[
+        ep["score_source"].eq("rule_rank")
+        & ep["threshold_q"].eq(0.95)
+        & ep["min_duration"].eq(10)
+    ].copy()
+    if ep.empty:
+        _blank(plots / "11_ep.png", "rule_rank q0.95 d10 example episodes not available")
+        return
+
+    by_sess = ep.groupby("session_key").agg(
+        longest_duration=("duration_min", "max"),
+        episode_count=("episode_id", "nunique"),
+        max_score=("max_score", "max"),
+    ).reset_index()
+    picks = []
+    longest = by_sess.sort_values(["longest_duration", "max_score"], ascending=[False, False])
+    if not longest.empty:
+        picks.append(("longest duration", longest.iloc[0]["session_key"]))
+    many = by_sess.sort_values(["episode_count", "longest_duration"], ascending=[False, False])
+    for _, row in many.iterrows():
+        if row["session_key"] not in [p[1] for p in picks]:
+            picks.append(("many episodes", row["session_key"]))
+            break
+    mid = by_sess.assign(_dist=(by_sess["longest_duration"] - by_sess["longest_duration"].median()).abs())
+    mid = mid.sort_values(["_dist", "max_score"], ascending=[True, False])
+    for _, row in mid.iterrows():
+        if row["session_key"] not in [p[1] for p in picks]:
+            picks.append(("middle duration", row["session_key"]))
+            break
+    for _, row in by_sess.sort_values(["max_score"], ascending=False).iterrows():
+        if len(picks) >= 3:
+            break
+        if row["session_key"] not in [p[1] for p in picks]:
+            picks.append(("additional example", row["session_key"]))
+    picks = picks[:3]
+    if not picks:
+        _blank(plots / "11_ep.png", "no episode examples available")
+        return
+
+    fig, axes = plt.subplots(len(picks), 1, figsize=(14, 3.8 * len(picks)), constrained_layout=True, sharex=False)
+    axes = np.array(axes).reshape(-1)
+    for ax, (label, key) in zip(axes, picks):
+        part = ms[ms["session_key"].eq(key)].copy().sort_values("minute_idx")
+        if part.empty:
+            ax.axis("off")
+            continue
+        ax.plot(part["minute_idx"], part["minute_mismatch_rank"], color="tab:blue", lw=1.7, label="rule_rank")
+        ax.set_ylabel("rule_rank")
+        ax.grid(alpha=0.25)
+        ax2 = ax.twinx()
+        ax2.plot(part["minute_idx"], part["chat_deficit"], color="tab:orange", alpha=0.55, lw=1.2, label="chat_deficit")
+        ax2.set_ylabel("chat_deficit")
+        ep_part = ep[ep["session_key"].eq(key)].copy()
+        for _, row in ep_part.iterrows():
+            start = pd.to_datetime(row["start_ts"])
+            end = pd.to_datetime(row["end_ts"])
+            sidx = part.loc[pd.to_datetime(part["minute_ts"]).ge(start), "minute_idx"].min()
+            eidx = part.loc[pd.to_datetime(part["minute_ts"]).le(end), "minute_idx"].max()
+            if pd.notna(sidx) and pd.notna(eidx):
+                ax.axvspan(sidx, eidx, color="tab:red", alpha=0.15)
+        ax.set_title(f"{label}: {key} ({len(ep_part)} episodes)")
+        ax.set_xlabel("minute_idx")
+    fig.suptitle(
+        "11 Method 2 episode examples - rule_rank q=0.95 min_duration=10 example operating point, not selected truth cutoff",
+        fontsize=14,
+    )
+    _save(fig, plots / "11_ep.png")
 
 
-def _write_plot_doc(out, manifest):
+def _plot_rank(out, plots):
+    cand = _read(out, "m2_candidates.csv")
+    if cand.empty:
+        _blank(plots / "12_m2_rank.png", "m2_candidates.csv not available")
+        return
+    top = cand[
+        cand["score_source"].eq("rule_rank")
+        & cand["threshold_q"].eq(0.95)
+        & cand["min_duration"].eq(10)
+    ].copy()
+    if top.empty:
+        _blank(plots / "12_m2_rank.png", "rule_rank q0.95 d10 candidates not available")
+        return
+    top = top.sort_values("candidate_rank").head(15).copy()
+    labels = top["session_key"].astype(str).iloc[::-1]
+    fig, ax = plt.subplots(1, 4, figsize=(19, 7), constrained_layout=True)
+    metrics = [
+        ("episode_total_duration_min", "episode total duration"),
+        ("episode_duration_ratio", "episode duration ratio"),
+        ("max_episode_score", "max episode score"),
+        ("p95_minute_score", "p95 minute score"),
+    ]
+    for a, (col, title) in zip(ax, metrics):
+        vals = pd.to_numeric(top[col], errors="coerce").iloc[::-1]
+        bars = a.barh(labels, vals, edgecolor="black", alpha=0.8)
+        a.set_title(title)
+        a.tick_params(axis="y", labelsize=8)
+        a.grid(axis="x", alpha=0.25)
+        if col == "episode_total_duration_min":
+            ranks = top["candidate_rank"].astype(int).iloc[::-1].tolist()
+            for bar, rank in zip(bars, ranks):
+                a.text(bar.get_width(), bar.get_y() + bar.get_height() / 2, f"  r{rank}", va="center", fontsize=8)
+    fig.suptitle(
+        "12 Method 2 candidate metrics - rule_rank q=0.95 min_duration=10 example operating point, not selected truth cutoff",
+        fontsize=14,
+    )
+    _save(fig, plots / "12_m2_rank.png")
+
+
+def _plot_pipe(plots):
+    labels = [
+        ("Load", "feature files"),
+        ("Minute State", "bin, deficit,\nzero-run, rolling"),
+        ("Minute Cluster", "KMeans state\nsummary"),
+        ("Rule Rank", "equal-weight\npercentiles"),
+        ("Window Evidence", "sliding windows\nand anomalies"),
+        ("Reason/RRA", "review priority\nnot label"),
+        ("Method 2 Handoff", "review\nevidence"),
+    ]
+    fig, ax = plt.subplots(figsize=(15, 4.8))
+    ax.axis("off")
+    xs = np.linspace(0.06, 0.94, len(labels))
+    for i, ((title, desc), x) in enumerate(zip(labels, xs)):
+        ax.text(x, 0.62, title, ha="center", va="center", fontsize=11, weight="bold", bbox=dict(boxstyle="round,pad=.35", facecolor="#F2F4F7", edgecolor="#333333"))
+        ax.text(x, 0.37, desc, ha="center", va="center", fontsize=9)
+        if i < len(labels) - 1:
+            ax.annotate("", xy=(xs[i + 1] - 0.05, 0.62), xytext=(x + 0.05, 0.62), arrowprops=dict(arrowstyle="->", lw=1.4, color="#333333"))
+    ax.set_title("13 Method 2 pipeline - review evidence mining, not ground-truth label", fontsize=14)
+    _save(fig, plots / "13_m2_pipe.png")
+
+
+def _write_plot_doc(out):
+    plots = Path(out) / "plots"
+    session = _read(out, "session_summary_processed.csv")
+    cluster_count = int(pd.to_numeric(session.get("cluster_number", pd.Series(dtype=float)), errors="coerce").nunique()) if not session.empty and "cluster_number" in session.columns else np.nan
+    notes = {
+        "01_data_quality.png": "데이터 품질과 필터링 개요; 정답 라벨/확률 아님",
+        "02_dist_time.png": "minute 분포와 시간 구조 확인; 정답 라벨/확률 아님",
+        "03_view_chat.png": "viewer-chat 동학 확인; 정답 라벨/확률 아님",
+        "04_cluster_session.png": f"session cluster 산점도; discrete legend for categorical cluster_number; {SESSION_CLUSTER_TITLE_NOTE}",
+        "05_session_k_selection.png": "session K 선택 근거; primary metric is composite selection_score, not inertia; not ground-truth label",
+        "06_session_cluster_profile.png": f"cluster profile heatmap; colorbar is within-metric scaled profile value, not cluster id; {SESSION_CLUSTER_TITLE_NOTE}",
+        "07_session_cluster_stability.png": "filename retained for backward compatibility; content is minute KMeans behavior-state stability diagnostic from mc_stab.csv ARI/subsample; supervised 성능지표 아님; 정답 라벨/확률 아님",
+        "07_ms.png": "Method 2 rule-rank score 분포; 정답 라벨/확률 아님",
+        "08_mc.png": "minute KMeans behavior state profile; colorbar is within-feature scaled profile value, not cluster id; 정답 라벨/확률 아님",
+        "08_cluster_minute.png": "alias/duplicate of 08_mc.png for handoff compatibility; colorbar is within-feature scaled profile value, not cluster id; 정답 라벨/확률 아님",
+        "13_m2_pipe.png": "Method 2 pipeline 개요; 정답 라벨/확률 아님",
+        "15_null.png": "shuffled null diagnostic; 정답 라벨/확률 아님",
+        "16_state.png": "minute state transition diagnostic; colorbar label is transition share, not cluster count; 정답 라벨/확률 아님",
+        "18_review.png": "수동 검토 우선순위 evidence 요약; 정답 라벨/확률 아님",
+        "19_reason.png": "counts top explanation reasons only; not confidence/lift/prediction rule",
+        "20_rra.png": "family RRA evidence rank; rra_q=family_rra_q이며 확률 아님; labels show top review candidates only",
+        "21_interval.png": "interval duration/empirical_p caution 진단; one shared colorbar is family consensus score, not probability",
+    }
+    actual = sorted(path.name for path in plots.glob("*.png"))
+    manifest = [f"plots/{name}" for name in actual]
+    rows = [{"file": file, "note": notes.get(Path(file).name, "generated plot; alias/diagnostic; 정답 라벨/확률 아님")} for file in manifest]
+    pd.DataFrame(rows).to_csv(Path(out) / "plot_manifest.csv", index=False, encoding="utf-8-sig")
+    audit_rows = [
+        {
+            "plot_file": "04_cluster_session.png",
+            "primary_visual_encoding": "cluster_number",
+            "encoding_type": "categorical",
+            "colorbar_or_legend": "legend",
+            "expected_category_count": cluster_count,
+            "actual_legend_count": cluster_count,
+            "colorbar_label": "",
+            "interpretation": "cluster_number is behavior cluster id, not probability or label",
+            "status": "PASS" if pd.notna(cluster_count) else "WARN",
+            "note": "scatter is drawn per cluster with discrete legend; no cluster_number colorbar",
+        },
+        {
+            "plot_file": "05_session_k_selection.png",
+            "primary_visual_encoding": "selection_score",
+            "encoding_type": "bar plus diagnostic lines",
+            "colorbar_or_legend": "legend",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "",
+            "interpretation": "selection_score is composite K selection evidence, not ground-truth label",
+            "status": "PASS",
+            "note": "inertia is not presented as selection criterion",
+        },
+        {
+            "plot_file": "06_session_cluster_profile.png",
+            "primary_visual_encoding": "profile scaled value",
+            "encoding_type": "continuous heatmap",
+            "colorbar_or_legend": "colorbar",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "within-metric scaled profile value, not cluster id",
+            "interpretation": "cell text is original profile value; color is relative within-feature contrast",
+            "status": "PASS",
+            "note": "colorbar is not cluster id",
+        },
+        {
+            "plot_file": "08_mc.png",
+            "primary_visual_encoding": "profile scaled value",
+            "encoding_type": "continuous heatmap",
+            "colorbar_or_legend": "colorbar",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "within-feature scaled profile value, not cluster id",
+            "interpretation": "cell text is original profile value; color is relative within-feature contrast",
+            "status": "PASS",
+            "note": "same content copied to 08_cluster_minute.png alias",
+        },
+        {
+            "plot_file": "16_state.png",
+            "primary_visual_encoding": "transition share",
+            "encoding_type": "continuous heatmap",
+            "colorbar_or_legend": "colorbar",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "transition share",
+            "interpretation": "colorbar is state transition proportion, not cluster count",
+            "status": "PASS",
+            "note": "state labels are active/mismatch",
+        },
+        {
+            "plot_file": "19_reason.png",
+            "primary_visual_encoding": "top explanation reason count",
+            "encoding_type": "bar",
+            "colorbar_or_legend": "none",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "",
+            "interpretation": "counts text_reason_included=True rows only; not confidence/lift/prediction rule",
+            "status": "PASS",
+            "note": "full m2_reason.csv rank rows are preserved",
+        },
+        {
+            "plot_file": "20_rra.png",
+            "primary_visual_encoding": "family_rra_q by review_order",
+            "encoding_type": "scatter",
+            "colorbar_or_legend": "none",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "",
+            "interpretation": "labels limited to top review candidates only",
+            "status": "PASS",
+            "note": "top 5 labels with staggered offsets",
+        },
+        {
+            "plot_file": "21_interval.png",
+            "primary_visual_encoding": "family_consensus_score",
+            "encoding_type": "scatter color",
+            "colorbar_or_legend": "one shared colorbar",
+            "expected_category_count": np.nan,
+            "actual_legend_count": np.nan,
+            "colorbar_label": "family consensus score, not probability",
+            "interpretation": "empirical_p is shuffled-null evidence, not detection probability",
+            "status": "PASS",
+            "note": "both subplots share one norm/cmap/colorbar",
+        },
+    ]
+    pd.DataFrame(audit_rows).to_csv(Path(out) / "plot_audit.csv", index=False, encoding="utf-8-sig")
     lines = [
-        "Plot 자동 생성 기록",
-        "====================",
-        "이 파일은 make_plots() 실행 시 out/plots/*.png와 함께 자동 생성된다.",
-        "그래프 구성은 기존 EDA notebook의 발표용 핵심 plot 흐름을 유지하되, overlay/중복 plot은 줄였다.",
+        "Plot Guide",
+        "==========",
+        "목적: 각 plot이 어떤 방법론 판단을 보조하는지와 어떤 결론을 낼 수 없는지 명시한다.",
+        "공통 주의: 모든 plot은 viewer-chat mismatch 기반 수동 검토 우선순위 evidence이며 정답 라벨/확률 아님.",
         "",
-        "공통 스타일",
-        "----------",
-        "저장: dpi=200, bbox_inches='tight'",
-        "폰트: Malgun Gothic 우선, DejaVu Sans fallback, unicode minus 보정",
-        "grid: alpha 0.2~0.3",
-        "session map 좌표: x=median_viewer(log scale), y=median_gap",
-        "session map 색: zero_chat_rate 또는 cluster label",
-        "session map 점 크기: 기존 notebook 방식 유지 - max_gap*30 또는 45+25*log1p(max_zero_run)",
-        "detector/model overlay: 일반 session은 alpha=0.25, flag/top session은 red edge와 alpha=0.9",
+        "Method 2 plots:",
+        *[f"- {Path(row['file']).name}: {row['note']}" for row in rows],
         "",
-        "생성 plot",
-        "---------",
+        "해석 제한:",
+        "- cluster_number와 minute_cluster는 behavior state id이며 정답 라벨/확률 아님.",
+        "- rra_q, family_rra_q, family_consensus_score, empirical_p는 확률이 아니며 수동 검토 우선순위 evidence이다.",
+        "- 04_cluster_session.png uses a discrete legend for categorical cluster_number and no cluster_number colorbar.",
+        "- 05_session_k_selection.png shows composite selection_score as the main selection basis; inertia is not a selection criterion.",
+        "- 06_session_cluster_profile.png colorbar is within-metric scaled profile value, not cluster id.",
+        "- 08_mc.png and 08_cluster_minute.png colorbar is within-feature scaled profile value, not cluster id.",
+        "- 16_state.png colorbar is transition share, not cluster count.",
+        "- 19_reason.png counts top explanation reasons only; not confidence/lift/prediction rule.",
+        "- 21_interval.png uses one shared colorbar for family consensus score, not probability.",
+        "- 07_session_cluster_stability.png 파일명은 backward compatibility를 위해 유지하지만 내용은 mc_stab.csv 기반 minute KMeans behavior-state stability diagnostic이며 supervised 성능지표가 아니다.",
+        "- plot_manifest.csv는 실제 out/plots/*.png 파일만 나열한다. 08_cluster_minute.png는 08_mc.png의 handoff alias/duplicate이다.",
+        "",
+        *[f"- {file}" for file in manifest],
     ]
-    if manifest:
-        lines.extend(f"- {name}" for name in manifest)
-    else:
-        lines.append("- no png generated")
-    lines += [
-        "",
-        "주요 파일 해석",
-        "------------",
-        "01_data_quality.png: 세션 필터링, zero-chat 품질 진단",
-        "02_dist_time.png: gap/chat 분포와 시간 경과별 median/IQR trajectory",
-        "03_view_chat.png: viewer-chat 관계, 1분 변화량, lag response",
-        "04_cluster.png: KMeans 선택/지도, profile, GMM/HDBSCAN robustness map",
-        "05_detectors.png: IF/LOF/OCSVM 비지도 detector별 review map",
-        "06_models.png: AE/Synthetic supervised model score별 review map",
-        "07_pu.png: manual positive label이 있을 때만 생성되는 PU score map",
-    ]
-    Path(out, "plot_guide.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (Path(out) / "plot_guide.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_plot_doc(out):
+    _write_plot_doc(out)
 
 
 def make_plots(minute_all, minute_model, session_all, session_model, out):
@@ -516,23 +754,18 @@ def make_plots(minute_all, minute_model, session_all, session_model, out):
     plots.mkdir(parents=True, exist_ok=True)
     for old in plots.glob("*.png"):
         old.unlink()
-    old_cluster = out / "cluster.png"
-    if old_cluster.exists():
-        old_cluster.unlink()
 
-    tables = {}
-    p = _plot_df(minute_model)
-    s = session_model.copy()
-
-    _quality_tables(session_all, s, tables)
-    _plot_quality(p, session_all, s, plots)
-    _plot_dist_time(p, plots)
-    _plot_view_chat(p, plots, tables)
-    _plot_cluster(s, out, plots, tables)
-    _plot_detectors(s, plots)
-    _plot_models(s, plots)
-
-    _write_tables(tables, out)
-    manifest = sorted(str(p.relative_to(out)) for p in plots.glob("*.png"))
-    pd.DataFrame({"plot_file": manifest}).to_csv(out / "plot_manifest.csv", index=False, encoding="utf-8-sig")
-    _write_plot_doc(out, manifest)
+    _plot_quality(minute_all, session_all, session_model, plots)
+    _plot_dist_time(minute_model, plots)
+    _plot_view_chat(minute_model, plots)
+    _plot_session_cluster(session_model, plots)
+    _plot_session_k_selection(out, plots)
+    _plot_session_cluster_profile(out, plots)
+    _plot_session_cluster_stability(out, plots)
+    _plot_ms(out, plots)
+    _plot_mc(out, plots)
+    _plot_sens(out, plots)
+    _plot_ep(out, plots)
+    _plot_rank(out, plots)
+    _plot_pipe(plots)
+    _write_plot_doc(out)

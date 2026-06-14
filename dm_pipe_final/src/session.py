@@ -3,6 +3,12 @@ import pandas as pd
 
 
 KEY = ["run_id", "broad_no"]
+DEFAULT_CLOCK_GAP_RESET_MIN = 1.1
+
+
+def clock_gap_reset_min(cfg=None):
+    cfg = cfg or {}
+    return float(cfg.get("prep", {}).get("clock_gap_reset_min", DEFAULT_CLOCK_GAP_RESET_MIN))
 
 
 def zero_run(s):
@@ -11,8 +17,23 @@ def zero_run(s):
     return z.groupby(block).cumcount().add(1).where(z, 0).astype(int)
 
 
-def add_plot_cols(df):
+def zero_run_clock(g, gap_reset_min=DEFAULT_CLOCK_GAP_RESET_MIN):
+    z = g["zero"].fillna(False).astype(bool)
+    gap = (
+        pd.to_datetime(g["minute_ts"], errors="coerce")
+        .diff()
+        .dt.total_seconds()
+        .div(60)
+        .gt(float(gap_reset_min))
+        .fillna(False)
+    )
+    block = (z.ne(z.shift()) | gap).cumsum()
+    return z.groupby(block).cumcount().add(1).where(z, 0).astype(int)
+
+
+def add_plot_cols(df, cfg=None):
     p = df.copy()
+    gap_reset_min = clock_gap_reset_min(cfg)
     p["minute_ts"] = pd.to_datetime(p["minute_ts"], errors="coerce")
     p = p.sort_values(KEY + ["minute_ts"]).reset_index(drop=True)
 
@@ -25,12 +46,14 @@ def add_plot_cols(df):
     p["ulog"] = np.log1p(p["unique_chatters"].clip(lower=0))
     p["gap"] = p["vlog"] - p["clog"]
     p["zero"] = p["chat_count"].eq(0)
-    p["zrun"] = p.groupby(KEY)["zero"].transform(zero_run)
+    p["zrun"] = 0
+    for _, idx in p.groupby(KEY, sort=False).groups.items():
+        p.loc[idx, "zrun"] = zero_run_clock(p.loc[idx], gap_reset_min=gap_reset_min).to_numpy()
     return p
 
 
 def make_session(minute_all, minute_model, cfg):
-    p = add_plot_cols(minute_all)
+    p = add_plot_cols(minute_all, cfg)
 
     sess = (
         p.groupby(KEY)

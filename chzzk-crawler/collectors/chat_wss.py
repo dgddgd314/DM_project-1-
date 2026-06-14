@@ -14,6 +14,7 @@ CHZZK_CHAT_CMD = {
     'ping'                : 0,
     'pong'                : 10000,
     'connect'             : 100,
+    'connect_ack'         : 10100,
     'request_recent_chat' : 5101,
     'chat'                : 93101,
     'donation'            : 93102,
@@ -75,7 +76,7 @@ class WssChatCollector(BaseChatCollector):
                 ws.send(json.dumps(pong_msg))
                 return
 
-            if cmd == CHZZK_CHAT_CMD['connect']:
+            if cmd in (CHZZK_CHAT_CMD['connect'], CHZZK_CHAT_CMD['connect_ack']):
                 self.sid = data.get('bdy', {}).get('sid')
                 # Request recent chat after connected
                 req_msg = {

@@ -6,26 +6,29 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from sklearn.preprocessing import RobustScaler
 from sklearn.cluster import KMeans
 try:
     from sklearn.cluster import HDBSCAN
 except Exception:
     HDBSCAN = None
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.mixture import GaussianMixture
 import joblib
 
-
-FEATS = ["log_viewer", "log_chat", "log_unique", "zero_rate", "gap_med", "log_zrun"]
-ASSIGN_COLS = ["session_key", "run_id", "broad_no", "cluster_number", "gmm", "hdbscan", "hdbscan_noise"]
-CLUSTER_COLORS = ["#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666"]
-EDGE_COLOR = "#222222"
+from src.k_selection import good_rank
 
 
-def _cluster_color(i):
-    return CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
+FEATS = ["log_viewer", "log_chat", "log_unique", "zero_rate", "log_zrun", "gap_med", "gap_max"]
+ASSIGN_COLS = [
+    "session_key",
+    "run_id",
+    "broad_no",
+    "cluster_number",
+    "gmm",
+    "hdbscan",
+    "hdbscan_noise",
+]
 
 
 def make_x(df, feats=FEATS):
@@ -33,86 +36,169 @@ def make_x(df, feats=FEATS):
     return x.fillna(x.median(numeric_only=True)).fillna(0)
 
 
+def _sparse_cluster_id(profile):
+    required = {"cluster_number", "zero_rate", "gap_med", "zrun_max", "chat_mean", "unique_mean"}
+    if profile.empty or not required.issubset(profile.columns):
+        return None
+    prof = profile.set_index("cluster_number")
+    sparse_score = (
+        prof["zero_rate"].rank(pct=True)
+        + prof["gap_med"].rank(pct=True)
+        + prof["zrun_max"].rank(pct=True)
+        + (-prof["chat_mean"]).rank(pct=True)
+        + (-prof["unique_mean"]).rank(pct=True)
+    ) / 5
+    if sparse_score.dropna().empty:
+        return None
+    return sparse_score.idxmax()
+
+
+def _cluster_size_balance(labels):
+    labels = pd.Series(labels)
+    counts = labels.value_counts()
+    if counts.empty or counts.max() == 0:
+        return np.nan
+    return float(counts.min() / counts.max())
+
+
+def _profile_separation(xs, labels):
+    work = pd.DataFrame(xs)
+    work["_cluster"] = labels
+    centers = work.groupby("_cluster").median(numeric_only=True)
+    if len(centers) < 2:
+        return np.nan
+    dists = []
+    vals = centers.to_numpy(dtype=float)
+    for i in range(len(vals)):
+        for j in range(i + 1, len(vals)):
+            dists.append(float(np.linalg.norm(vals[i] - vals[j])))
+    return float(np.mean(dists)) if dists else np.nan
+
+
+def _kmeans_selection_score(sel):
+    if sel.empty:
+        return sel
+    work = sel.copy()
+    metrics = {
+        "silhouette": True,
+        "calinski_harabasz": True,
+        "davies_bouldin": False,
+        "cluster_size_balance": True,
+        "cluster_profile_separation": True,
+    }
+    rank_cols = []
+    for col, higher_is_better in metrics.items():
+        if col not in work.columns or pd.to_numeric(work[col], errors="coerce").notna().sum() == 0:
+            continue
+        rcol = f"_{col}_rank"
+        work[rcol] = good_rank(work[col], higher_is_better=higher_is_better)
+        rank_cols.append(rcol)
+    work["selection_score"] = work[rank_cols].mean(axis=1, skipna=True) if rank_cols else np.nan
+    return work.drop(columns=rank_cols, errors="ignore")
+
+
 def write_doc(out, cfg, k_min, k_max, best_k, gmm_note="", hdb_note="", note=""):
-    txt = [
-        "클러스터링 자동 설정 기록",
-        "========================",
-        "이 파일은 add_cluster() 실행 시 현재 cfg.yml과 실제 session 수를 기준으로 생성됨.",
-        "목적: 방송 세션의 viewer-chat 행동 유형을 분류한다. 뷰봇 정답 라벨 생성용이 아니다.",
+    cluster_cfg = cfg.get("cluster", {})
+    scaler_name = cluster_cfg.get("scaler", "RobustScaler")
+    try:
+        select = pd.read_csv(Path(out) / "cluster_select.csv", encoding="utf-8-sig")
+    except Exception:
+        select = pd.DataFrame()
+    try:
+        profile = pd.read_csv(Path(out) / "cluster_profile.csv", encoding="utf-8-sig")
+    except Exception:
+        profile = pd.DataFrame()
+
+    select_lines = []
+    if select.empty:
+        select_lines.append("- 후보 K 평가표가 비어 있다.")
+    else:
+        cols = [c for c in ["k", "silhouette", "calinski_harabasz", "davies_bouldin", "cluster_size_balance", "cluster_profile_separation", "selection_score", "selected"] if c in select.columns]
+        for _, row in select.sort_values("k").iterrows():
+            parts = []
+            for col in cols:
+                val = row.get(col)
+                if isinstance(val, float):
+                    val = f"{val:.4g}"
+                parts.append(f"{col}={val}")
+            select_lines.append("- " + ", ".join(parts))
+
+    profile_lines = []
+    if profile.empty:
+        profile_lines.append("- 군집 profile을 만들 수 없었다.")
+    else:
+        sparse_cluster = _sparse_cluster_id(profile)
+        for _, row in profile.sort_values("cluster_number").iterrows():
+            cid = row.get("cluster_number")
+            meaning = "viewer 대비 채팅 반응 약한 세션 행동 군집" if sparse_cluster is not None and cid == sparse_cluster else "상대적으로 채팅 반응이 활발하거나 혼합된 세션 행동 군집"
+            metrics = []
+            for col in ["n", "viewer_med", "chat_mean", "unique_mean", "zero_rate", "gap_med", "zrun_max"]:
+                if col in row.index:
+                    val = row.get(col)
+                    if isinstance(val, float):
+                        val = f"{val:.4g}"
+                    metrics.append(f"{col}={val}")
+            profile_lines.append(f"- cluster_number={cid}: {meaning}; " + ", ".join(metrics))
+
+    lines = [
+        "세션 행동 군집 문서",
+        "==================",
         "",
-        "공통 입력",
-        "---------",
-        "입력 데이터: session_model = session_all 중 min_n 이상, viewer QC 통과, all-zero chat 제외 세션",
-        "분석 단위: session = run_id + broad_no",
-        f"사용 feature: {', '.join(FEATS)}",
-        "feature 처리: inf/-inf -> NaN, feature median 대체, 잔여 NaN은 0 대체",
-        "스케일링: RobustScaler",
-        "모델 입력값: RobustScaler.fit_transform(cluster_features)",
+        "분석 단위: 방송 세션.",
+        "세션 정의: run_id + broad_no.",
+        "session_summary_processed.csv 생성 방식: minute_model.csv의 1분 row를 세션 단위로 집계하고, 설정 파일의 최소 관측 길이 기준을 통과한 세션에 대해 비지도 군집 번호를 부여한다.",
+        "cluster_number의 의미: 세션 요약 feature로 계산한 세션 행동 군집 번호이며, 정답 라벨이나 확률이 아니다.",
         "",
-        "1) KMeans main clustering",
-        "-------------------------",
-        f"K 후보: {k_min}..{k_max}",
-        f"선택된 K: {best_k}",
-        "K 선택 기준: silhouette 최대, 동률이면 더 작은 K",
-        f"hyperparameter: n_clusters={best_k}, random_state={cfg['cluster']['seed']}, n_init={cfg['cluster']['n_init']}",
-        "출력 컬럼: cluster_number",
+        "사용 feature:",
+        *[f"- {feature}" for feature in FEATS],
         "",
-        "2) GMM robustness check",
-        "------------------------",
-        "역할: KMeans와 다른 확률적 mixture 관점에서 세션 유형 구조가 비슷한지 확인",
-        "n_components 후보: 2..min(6, n_session-1)",
-        "선택 기준: BIC 최소, 동률이면 작은 n_components",
-        f"선택된 GMM components: {gmm_note}",
-        "hyperparameter: covariance_type='full', n_init=10, random_state=cluster.seed",
-        "출력 컬럼: gmm",
+        "스케일링:",
+        f"- 적용: 적용",
+        f"- 사용 방식: {scaler_name}",
+        "- 선택 이유: viewer/chat 계열 변수의 heavy-tail과 극단값 영향을 줄이기 위해 중앙값/IQR 기반 스케일링을 사용한다.",
         "",
-        "3) HDBSCAN density check",
-        "------------------------",
-        "역할: 미리 K를 정하지 않는 밀도 기반 관점에서 noise와 cluster 구조를 확인",
-        "min_cluster_size 후보: cfg.hdbscan.min_sizes",
-        "min_samples: max(2, min_cluster_size//2)",
-        "선택 기준: balanced_score=silhouette*(1-noise_ratio), 유효 해가 없으면 noise_ratio 최소",
-        f"선택된 HDBSCAN min_cluster_size: {hdb_note}",
-        "출력 컬럼: hdbscan, hdbscan_noise",
+        "사용한 clustering 알고리즘:",
+        "- KMeans: 최종 cluster_number 후보.",
+        "- GMM: component 기반 하위 구조 진단.",
+        "- HDBSCAN: 밀도 기반 안정 군집과 noise 비중 진단. 여기서 noise는 이상치 확정이 아니라 안정 군집에 속하지 않은 상태를 뜻한다.",
         "",
-        "저장 파일",
-        "---------",
-        "out/cluster_select.csv: KMeans K 선택 과정",
-        "out/gmm_select.csv: GMM component 선택 과정",
-        "out/hdbscan_select.csv: HDBSCAN min_cluster_size 선택 과정",
-        "out/cluster_profile.csv: cluster별 요약 profile",
-        "out/cluster_assignments.csv: session_key별 cluster_number/gmm/hdbscan 결과",
-        "out/plots/04_cluster.png: 발표용 clustering summary plot",
+        "후보 하이퍼파라미터:",
+        f"- KMeans K 후보: {k_min}..{k_max}",
+        f"- KMeans random_state: {cfg['cluster']['seed']}",
+        f"- KMeans n_init: {cfg['cluster']['n_init']}",
+        f"- GMM n_components 후보: {gmm_note}",
+        f"- HDBSCAN min_cluster_size 후보: {hdb_note}",
         "",
-        "시각화 스타일",
-        "-------------",
-        "좌표: x=viewer_med(log scale), y=gap_med",
-        "점 크기: 45 + 25*log1p(zrun_max)",
-        "색: cluster label, cmap=tab10",
-        "주의: cluster_number/gmm/hdbscan은 뷰봇 정답 라벨이 아니라 세션 행동 유형 라벨입니다.",
+        "최종 선택:",
+        f"- 선택된 알고리즘: KMeans",
+        f"- 선택된 K: {best_k}",
+        "- 선택 근거: silhouette, Calinski-Harabasz, Davies-Bouldin, 군집 크기 균형, 군집 profile 분리도를 함께 비교하여 해석 안정성이 높은 K를 선택했다.",
+        "",
+        "K 후보별 평가:",
+        *select_lines,
+        "",
+        "군집 번호별 profile 요약:",
+        *profile_lines,
+        "",
+        "주의:",
+        "- cluster_number는 정답 라벨이나 확률이 아니라 세션 행동 군집 번호다.",
+        "- viewer 대비 채팅 반응이 약한 profile은 수동 검토 근거 중 하나일 뿐이며 확정 판정이 아니다.",
     ]
     if note:
-        txt.append(f"비고: {note}")
-    Path(out, "cluster.txt").write_text("\n".join(txt) + "\n", encoding="utf-8")
+        lines.append(f"비고: {note}")
+    Path(out, "cluster.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-
-def save_plot(s, out):
-    # Plotting is centralized in src/plots.py.
-    # Do not create out/cluster.png, because final slides use out/plots/04_cluster.png.
-    return None
 
 def add_gmm(s, xs, cfg):
     if len(s) < 4:
         s["gmm"] = np.nan
         return s, pd.DataFrame(columns=["n", "bic", "aic"]), "not available"
-
     rows, labels = [], {}
     for n in range(2, min(6, len(s) - 1) + 1):
         gm = GaussianMixture(n_components=n, random_state=int(cfg["cluster"]["seed"]), n_init=10)
         lab = gm.fit_predict(xs)
         rows.append({"n": n, "bic": gm.bic(xs), "aic": gm.aic(xs)})
         labels[n] = lab
-
     sel = pd.DataFrame(rows)
     best = int(sel.sort_values(["bic", "n"]).iloc[0]["n"])
     s["gmm"] = labels[best]
@@ -124,19 +210,16 @@ def add_hdbscan(s, xs, cfg):
         s["hdbscan"] = np.nan
         s["hdbscan_noise"] = np.nan
         return s, pd.DataFrame(), "not available"
-
     sizes = cfg.get("hdbscan", {}).get("min_sizes", [5, 8, 10])
     sizes = sorted({int(v) for v in sizes if 2 <= int(v) < len(s)})
     if not sizes:
         sizes = [max(2, min(5, len(s) - 1))]
-
     rows, labels = [], {}
     for min_size in sizes:
         min_samples = max(2, min_size // 2)
         model = HDBSCAN(min_cluster_size=min_size, min_samples=min_samples, metric="euclidean", copy=True)
         lab = model.fit_predict(xs)
         labels[min_size] = lab
-
         non_noise = lab != -1
         n_noise = int((lab == -1).sum())
         n_cluster = len([x for x in np.unique(lab) if x != -1])
@@ -154,7 +237,6 @@ def add_hdbscan(s, xs, cfg):
             "silhouette": sil,
             "balanced_score": sil * (1 - noise_ratio) if np.isfinite(sil) else np.nan,
         })
-
     sel = pd.DataFrame(rows)
     valid = sel.dropna(subset=["balanced_score"])
     valid = valid[valid["n_clusters"].ge(2)]
@@ -162,7 +244,6 @@ def add_hdbscan(s, xs, cfg):
         best = int(sel.sort_values(["noise_ratio", "min_cluster_size"]).iloc[0]["min_cluster_size"])
     else:
         best = int(valid.sort_values(["balanced_score", "silhouette", "coverage"], ascending=[False, False, False]).iloc[0]["min_cluster_size"])
-
     s["hdbscan"] = labels[best]
     s["hdbscan_noise"] = s["hdbscan"].eq(-1).astype(int)
     return s, sel, str(best)
@@ -179,13 +260,12 @@ def add_cluster(df, out, cfg):
         s["gmm"] = np.nan
         s["hdbscan"] = np.nan
         s["hdbscan_noise"] = np.nan
-        pd.DataFrame(columns=["k", "silhouette", "inertia"]).to_csv(out / "cluster_select.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=["k", "silhouette", "calinski_harabasz", "davies_bouldin", "cluster_size_balance", "cluster_profile_separation", "inertia", "selection_score", "selected"]).to_csv(out / "cluster_select.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame(columns=["n", "bic", "aic"]).to_csv(out / "gmm_select.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame().to_csv(out / "hdbscan_select.csv", index=False, encoding="utf-8-sig")
         s[ASSIGN_COLS].to_csv(out / "cluster_assignments.csv", index=False, encoding="utf-8-sig")
-        save_plot(s, out)
-        write_doc(out, cfg, k_min, k_max_cfg, 1, note="세션 수가 3개 미만이라 단일 cluster로 고정")
-        return s
+        write_doc(out, cfg, k_min, k_max_cfg, 1, note="fewer than 3 eligible sessions")
+        return s.drop(columns=["gmm", "hdbscan", "hdbscan_noise"], errors="ignore")
 
     scaler = RobustScaler()
     xs = scaler.fit_transform(make_x(s))
@@ -197,18 +277,28 @@ def add_cluster(df, out, cfg):
         lab = km.fit_predict(xs)
         if len(np.unique(lab)) < 2:
             continue
-        rows.append({"k": k, "silhouette": silhouette_score(xs, lab), "inertia": km.inertia_})
+        rows.append({
+            "k": k,
+            "silhouette": silhouette_score(xs, lab),
+            "calinski_harabasz": calinski_harabasz_score(xs, lab),
+            "davies_bouldin": davies_bouldin_score(xs, lab),
+            "cluster_size_balance": _cluster_size_balance(lab),
+            "cluster_profile_separation": _profile_separation(xs, lab),
+            "inertia": km.inertia_,
+            "selected": False,
+        })
         models[k] = km
         labels[k] = lab
 
     if not rows:
         s["cluster_number"] = 0
         best_k = 1
-        sel = pd.DataFrame(columns=["k", "silhouette", "inertia"])
-        note = "세션 feature가 거의 동일해 단일 cluster로 고정"
+        sel = pd.DataFrame(columns=["k", "silhouette", "calinski_harabasz", "davies_bouldin", "cluster_size_balance", "cluster_profile_separation", "inertia", "selection_score", "selected"])
+        note = "session features are nearly identical; single behavior cluster used"
     else:
-        sel = pd.DataFrame(rows)
-        best_k = int(sel.sort_values(["silhouette", "k"], ascending=[False, True]).iloc[0]["k"])
+        sel = _kmeans_selection_score(pd.DataFrame(rows))
+        best_k = int(sel.sort_values(["selection_score", "silhouette", "k"], ascending=[False, False, True]).iloc[0]["k"])
+        sel.loc[sel["k"].eq(best_k), "selected"] = True
         s["cluster_number"] = labels[best_k]
         note = ""
 
@@ -224,6 +314,8 @@ def add_cluster(df, out, cfg):
         gap_med=("gap_med", "median"),
         zrun_max=("zrun_max", "median"),
     ).reset_index()
+    sparse_cluster = _sparse_cluster_id(profile) if best_k > 1 else None
+    profile["cluster_is_sparse_silent_like"] = profile["cluster_number"].eq(sparse_cluster) if sparse_cluster is not None else False
 
     sel.to_csv(out / "cluster_select.csv", index=False, encoding="utf-8-sig")
     g_sel.to_csv(out / "gmm_select.csv", index=False, encoding="utf-8-sig")
@@ -236,5 +328,4 @@ def add_cluster(df, out, cfg):
         joblib.dump({"features": FEATS, "scaler": scaler, "kmeans": models[best_k], "best_k": best_k}, out / "kmeans_bundle.joblib")
 
     write_doc(out, cfg, k_min, k_max, best_k, gmm_note=g_note, hdb_note=h_note, note=note)
-    save_plot(s, out)
-    return s
+    return s.drop(columns=["gmm", "hdbscan", "hdbscan_noise"], errors="ignore")
